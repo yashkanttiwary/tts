@@ -18,6 +18,8 @@ export const generateSpeechFromText = async (config: GenerationConfig, apiKey?: 
   let languageDirective = "";
   if (config.language === 'hi') {
     languageDirective = "Strictly speak the following text in Hindi. If the text is written in Devanagari, read it naturally. If the text is written in Latin script (Hinglish), pronounce it with a proper, native Hindi accent.";
+  } else if (config.language === 'hinglish') {
+    languageDirective = "The following text is in Hinglish (a conversational blend of Hindi and English). Speak it with a natural, urban Indian accent. Pronounce Hindi words authentically (even if written in Latin script) and English words with a slight Indian inflection, just like a native bilingual speaker from India.";
   } else {
     languageDirective = "Read the following text in English.";
   }
