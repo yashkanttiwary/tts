@@ -15,6 +15,7 @@ export interface GenerationConfig {
   instruction: string;
   voice: string;
   language: string;
+  previousText?: string;
 }
 
 export enum TTSStatus {

@@ -24,10 +24,16 @@ export const generateSpeechFromText = async (config: GenerationConfig, apiKey?: 
     languageDirective = "Read the following text in English.";
   }
 
+  // Context awareness
+  let contextPrompt = "";
+  if (config.previousText) {
+    contextPrompt = `\nPREVIOUS CONTEXT (The speaker just said this. Maintain the flow, tone, and pacing from this context, but DO NOT repeat it):\n"...${config.previousText}"\n`;
+  }
+
   // Construct the final prompt
   const promptText = config.instruction 
-    ? `${languageDirective}\nStyle instruction: ${config.instruction}\n\nText to speak:\n${config.text}`
-    : `${languageDirective}\n\nText to speak:\n${config.text}`;
+    ? `${languageDirective}${contextPrompt}\nStyle instruction: ${config.instruction}\n\nText to speak:\n${config.text}`
+    : `${languageDirective}${contextPrompt}\n\nText to speak:\n${config.text}`;
 
   let lastError: any;
   const MAX_RETRIES = 3;
