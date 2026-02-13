@@ -3,7 +3,11 @@ import { GenerationConfig } from "../types";
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-export const generateSpeechFromText = async (config: GenerationConfig, apiKey?: string): Promise<string> => {
+export const generateSpeechFromText = async (
+  config: GenerationConfig, 
+  apiKey?: string,
+  onStatusUpdate?: (msg: string) => void
+): Promise<string> => {
   // Prioritize user-provided key, fallback to env var (safely checked for browser)
   let envKey = '';
   try {
@@ -39,15 +43,18 @@ export const generateSpeechFromText = async (config: GenerationConfig, apiKey?: 
     : `${languageDirective}\n\nText to speak:\n${config.text}`;
 
   let lastError: any;
-  const MAX_RETRIES = 3;
+  // Infinite retries for Rate Limits (within reason), finite for others
+  const MAX_RETRIES = 3; 
+  let attempt = 0;
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  while (true) {
     try {
+      attempt++;
       const response = await ai.models.generateContent({
         model: modelName,
         contents: [{ parts: [{ text: promptText }] }],
         config: {
-          responseModalities: [Modality.AUDIO], // CRITICAL: Tell Gemini we want Audio back
+          responseModalities: [Modality.AUDIO],
           speechConfig: {
             voiceConfig: {
               prebuiltVoiceConfig: {
@@ -58,48 +65,68 @@ export const generateSpeechFromText = async (config: GenerationConfig, apiKey?: 
         }
       });
 
-      // Extract the inline audio data
       const candidates = response.candidates;
-      if (!candidates || candidates.length === 0) {
-        throw new Error("No candidates returned from Gemini");
-      }
+      if (!candidates || candidates.length === 0) throw new Error("No candidates returned from Gemini");
 
       const parts = candidates[0].content?.parts;
-      if (!parts || parts.length === 0) {
-        throw new Error("No content parts returned");
-      }
+      if (!parts || parts.length === 0) throw new Error("No content parts returned");
 
-      // Look for inlineData which contains the audio
       const audioPart = parts.find(p => p.inlineData);
       
       if (!audioPart || !audioPart.inlineData || !audioPart.inlineData.data) {
-         // Fallback check: sometimes errors come back as text in the parts
          const textPart = parts.find(p => p.text);
-         if (textPart) {
-           throw new Error(`Model returned text instead of audio: "${textPart.text}". Try adjusting your prompt.`);
-         }
+         if (textPart) throw new Error(`Model returned text instead of audio: "${textPart.text}". Try adjusting your prompt.`);
          throw new Error("No audio data found in response.");
       }
 
-      return audioPart.inlineData.data; // This is the Base64 string of PCM data
+      return audioPart.inlineData.data;
 
     } catch (error: any) {
-      console.warn(`TTS generation attempt ${attempt + 1} failed:`, error);
       lastError = error;
+      
+      // --- RATE LIMIT HANDLING (429) ---
+      const isRateLimit = error.status === 429 || (error.message && error.message.includes('429')) || (error.status === 503);
+      
+      if (isRateLimit) {
+        // Try to parse the specific wait time from the error message
+        // Example: "Please retry in 52.232015042s"
+        const waitTimeMatch = error.message?.match(/retry in (\d+(\.\d+)?)s/);
+        let waitTime = 30000; // Default wait 30s if we can't parse it
+        
+        if (waitTimeMatch && waitTimeMatch[1]) {
+           // Add 1s buffer to be safe
+           waitTime = Math.ceil(parseFloat(waitTimeMatch[1])) * 1000 + 2000;
+        }
 
-      // Don't retry if it's a client-side prompt issue (400 Bad Request) or Auth error (403)
+        const waitSeconds = Math.ceil(waitTime / 1000);
+        console.warn(`Rate limit hit. Pausing for ${waitSeconds}s before retrying...`);
+        
+        if (onStatusUpdate) {
+          onStatusUpdate(`Rate limit hit (Free Tier). Pausing for ${waitSeconds}s...`);
+        }
+
+        await delay(waitTime);
+        continue; // Retry loop without incrementing "attempt" counter effectively allowing infinite rate limit retries
+      }
+
+      // --- STANDARD ERROR HANDLING ---
+      console.warn(`TTS generation attempt ${attempt} failed:`, error);
+
+      // Don't retry client errors
       if (error.status === 400 || error.status === 403 || (error.message && (error.message.includes("400") || error.message.includes("403")))) {
         break;
       }
       
-      // If we haven't reached max retries, wait and try again
-      if (attempt < MAX_RETRIES - 1) {
-        // Exponential backoff: 1s, 2s, 4s
-        await delay(1000 * Math.pow(2, attempt)); 
+      // Standard exponential backoff for other errors (500s)
+      if (attempt < MAX_RETRIES) {
+        const backoff = 1000 * Math.pow(2, attempt);
+        if (onStatusUpdate) onStatusUpdate(`Error occurred. Retrying in ${backoff/1000}s...`);
+        await delay(backoff);
+      } else {
+        break; // Give up
       }
     }
   }
 
-  // If we exit the loop, we failed
   throw new Error(lastError?.message || "Failed to generate speech. Please check your API Key and try again.");
 };

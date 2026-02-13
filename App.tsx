@@ -8,9 +8,11 @@ import StylePresets from './components/StylePresets';
 import LanguageSelector from './components/LanguageSelector';
 import ApiKeyModal from './components/ApiKeyModal';
 
-const MAX_CHARS = 100000;
+// Increased limit for "Book Mode"
+const MAX_CHARS = 500000;
 const CHUNK_SIZE = 1000; 
-const BATCH_SIZE = 2;    
+// Batch size set to 1 for sequential processing to handle rate limits gracefully
+const BATCH_SIZE = 1;    
 
 const VOICES: VoiceOption[] = [
   { name: 'Puck', gender: 'Male', style: 'Upbeat & Playful', description: 'Great for storytelling and lively content.' },
@@ -158,33 +160,32 @@ export default function App() {
     try {
       const chunks = splitTextIdeally(currentText, CHUNK_SIZE);
       const pcmChunks: Uint8Array[] = new Array(chunks.length);
+      const totalChunks = chunks.length;
 
-      const totalBatches = Math.ceil(chunks.length / BATCH_SIZE);
-
-      for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-        const batchSlice = chunks.slice(i, i + BATCH_SIZE);
-        const currentBatchIndex = Math.floor(i / BATCH_SIZE) + 1;
+      // Sequential processing to respect strict rate limits
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
         
-        setProgressMessage(`Synthesizing batch ${currentBatchIndex} of ${totalBatches}...`);
+        setProgressMessage(`Processing part ${i + 1} of ${totalChunks}...`);
 
-        const batchPromises = batchSlice.map((chunk, idx) => {
-          const globalIndex = i + idx;
-          return generateSpeechFromText({
-            text: chunk,
-            instruction,
-            voice: selectedVoice,
-            language: selectedLanguage
-          }, apiKey).then(base64 => ({ index: globalIndex, data: base64ToUint8Array(base64) }));
-        });
+        // We pass setProgressMessage to the service so it can update us if it hits a rate limit wait
+        const base64Audio = await generateSpeechFromText({
+          text: chunk,
+          instruction,
+          voice: selectedVoice,
+          language: selectedLanguage
+        }, apiKey, (statusMsg) => setProgressMessage(`Part ${i + 1}/${totalChunks}: ${statusMsg}`));
 
-        const results = await Promise.all(batchPromises);
-        
-        results.forEach(res => {
-          pcmChunks[res.index] = res.data;
-        });
+        pcmChunks[i] = base64ToUint8Array(base64Audio);
+
+        // Optional: Artificial small delay between successful chunks to be nice to the API
+        // if we are not at the last chunk.
+        if (i < chunks.length - 1) {
+           await new Promise(r => setTimeout(r, 500));
+        }
       }
 
-      setProgressMessage('Finalizing audio...');
+      setProgressMessage('Stitching audio...');
       const mergedPcm = mergeBuffers(pcmChunks);
       const wavBuffer = pcmToWav(mergedPcm.buffer);
       const blob = new Blob([wavBuffer], { type: 'audio/wav' });
