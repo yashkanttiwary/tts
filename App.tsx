@@ -1,8 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge } from 'lucide-react';
+import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus } from './types';
 import { generateSpeechFromText } from './services/geminiService';
-import { pcmToWav, base64ToUint8Array, mergeBuffers } from './utils/audioUtils';
+import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
 import VoiceSelector from './components/VoiceSelector';
 import StylePresets from './components/StylePresets';
 import LanguageSelector from './components/LanguageSelector';
@@ -60,20 +60,29 @@ export default function App() {
   const [apiKey, setApiKey] = useState('');
   const [isApiModalOpen, setIsApiModalOpen] = useState(false);
 
-  // We use this state to track plain text for the API and character count
+  // Content State
   const [text, setText] = useState('Welcome to the Gemini Voice Studio. I can transform any text into lifelike speech.\n\nSelect Hindi from the menu to hear me speak in a native Indian accent. I will highlight the text as I read it.');
   
   const [instruction, setInstruction] = useState('');
   const [selectedVoice, setSelectedVoice] = useState('Puck');
   const [selectedLanguage, setSelectedLanguage] = useState('en');
+  
+  // Generation State
   const [status, setStatus] = useState<TTSStatus>(TTSStatus.IDLE);
   const [progressMessage, setProgressMessage] = useState('');
   const [error, setError] = useState('');
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  
+  // Playback State
   const [playbackRate, setPlaybackRate] = useState(1.0);
+  const [livePreview, setLivePreview] = useState(true);
   
   const audioRef = useRef<HTMLAudioElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
+  
+  // Refs for Live Preview (Web Audio API)
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const nextAudioStartTimeRef = useRef<number>(0);
 
   // Load API key from local storage on mount
   useEffect(() => {
@@ -82,7 +91,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    return () => { if (audioUrl) URL.revokeObjectURL(audioUrl); };
+    return () => { 
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => {});
+      }
+    };
   }, [audioUrl]);
 
   // Handle auto-play and playback rate application
@@ -90,11 +104,13 @@ export default function App() {
     if (audioRef.current) {
       audioRef.current.playbackRate = playbackRate;
       
-      if (status === TTSStatus.SUCCESS && audioUrl) {
+      // Only auto-play the final stitched audio if we DIDN'T just listen to it live
+      // Otherwise it's annoying to hear it start over immediately
+      if (status === TTSStatus.SUCCESS && audioUrl && !livePreview) {
         audioRef.current.play().catch(e => console.log("Auto-play blocked"));
       }
     }
-  }, [status, audioUrl, playbackRate]);
+  }, [status, audioUrl, playbackRate, livePreview]);
 
   // Initial content setup
   useEffect(() => {
@@ -130,6 +146,38 @@ export default function App() {
     document.body.removeChild(link);
   };
 
+  // Helper to play a single PCM chunk immediately
+  const playChunkLive = (pcmData: Uint8Array) => {
+    if (!audioContextRef.current) return;
+    
+    try {
+      const ctx = audioContextRef.current;
+      
+      // Convert raw bytes to Float32 AudioBuffer
+      const float32Data = convertInt16ToFloat32(pcmData);
+      
+      // Create buffer (Mono, matches array length, 24kHz sample rate of Gemini)
+      const buffer = ctx.createBuffer(1, float32Data.length, 24000);
+      buffer.getChannelData(0).set(float32Data);
+
+      // Create Source
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+
+      // Schedule Playback
+      // If we are falling behind (gap in audio), start immediately (currentTime).
+      // If we are ahead (streaming fast), append to end of queue (nextAudioStartTimeRef).
+      const startTime = Math.max(ctx.currentTime, nextAudioStartTimeRef.current);
+      source.start(startTime);
+      
+      // Advance the pointer
+      nextAudioStartTimeRef.current = startTime + buffer.duration;
+    } catch (e) {
+      console.warn("Live preview error:", e);
+    }
+  };
+
   const handleGenerate = async () => {
     // Check for API key safely
     let envKey = '';
@@ -157,6 +205,17 @@ export default function App() {
     if (audioUrl) URL.revokeObjectURL(audioUrl);
     setAudioUrl(null);
 
+    // Initialize Web Audio Context for Live Preview
+    if (livePreview) {
+      try {
+        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        audioContextRef.current = new AudioContextClass();
+        nextAudioStartTimeRef.current = audioContextRef.current.currentTime;
+      } catch (e) {
+        console.warn("Web Audio API not supported, disabling live preview");
+      }
+    }
+
     try {
       const chunks = splitTextIdeally(currentText, CHUNK_SIZE);
       const pcmChunks: Uint8Array[] = new Array(chunks.length);
@@ -176,10 +235,16 @@ export default function App() {
           language: selectedLanguage
         }, apiKey, (statusMsg) => setProgressMessage(`Part ${i + 1}/${totalChunks}: ${statusMsg}`));
 
-        pcmChunks[i] = base64ToUint8Array(base64Audio);
+        const pcmData = base64ToUint8Array(base64Audio);
+        pcmChunks[i] = pcmData;
+
+        // --- LIVE PREVIEW ---
+        // If enabled, play this chunk immediately while the next one generates
+        if (livePreview && audioContextRef.current) {
+          playChunkLive(pcmData);
+        }
 
         // Optional: Artificial small delay between successful chunks to be nice to the API
-        // if we are not at the last chunk.
         if (i < chunks.length - 1) {
            await new Promise(r => setTimeout(r, 500));
         }
@@ -199,6 +264,9 @@ export default function App() {
       setError(err.message || "An unexpected error occurred.");
       setStatus(TTSStatus.ERROR);
       setProgressMessage('');
+    } finally {
+      // We don't close the audio context here immediately because the audio might still be playing from the buffer
+      // However, we can let it garbage collect or close it when the new generation starts
     }
   };
 
@@ -312,6 +380,24 @@ export default function App() {
                         className="w-full bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-900 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 placeholder:text-slate-400 dark:placeholder:text-slate-600 transition-all shadow-sm"
                      />
                   </div>
+                  
+                  {/* Live Preview Toggle */}
+                  <button
+                    onClick={() => setLivePreview(!livePreview)}
+                    disabled={isLoading}
+                    className={`
+                       flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold border transition-all
+                       ${livePreview 
+                          ? 'bg-indigo-50 dark:bg-indigo-900/20 border-indigo-200 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300' 
+                          : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400'
+                       }
+                    `}
+                    title="Play audio chunks as soon as they are generated"
+                  >
+                    <Volume2 className={`w-3.5 h-3.5 ${livePreview ? 'animate-pulse' : ''}`} />
+                    <span className="hidden sm:inline">Live Preview</span>
+                  </button>
+
                   <div className={`text-[10px] md:text-xs font-mono font-medium px-2.5 py-1.5 rounded-md border 
                     ${text.length > MAX_CHARS 
                       ? 'text-red-600 dark:text-red-400 border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-900/10' 
@@ -402,6 +488,7 @@ export default function App() {
                       <div className="w-full text-center text-sm text-slate-500 dark:text-slate-500 italic flex items-center justify-center gap-2">
                          {isLoading ? (
                            <div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400">
+                             {livePreview && <Volume2 className="w-4 h-4 animate-pulse" />}
                              <span className="animate-pulse font-medium">{progressMessage || 'Initializing...'}</span>
                            </div>
                          ) : (

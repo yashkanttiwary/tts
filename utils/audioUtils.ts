@@ -83,3 +83,16 @@ export const mergeBuffers = (buffers: Uint8Array[]): Uint8Array => {
   }
   return result;
 };
+
+/**
+ * Converts Int16 PCM data (as bytes) to Float32 for Web Audio API.
+ */
+export const convertInt16ToFloat32 = (pcmData: Uint8Array): Float32Array => {
+  const int16Data = new Int16Array(pcmData.buffer);
+  const float32Data = new Float32Array(int16Data.length);
+  // Normalize Int16 (-32768 to 32767) to Float32 (-1.0 to 1.0)
+  for (let i = 0; i < int16Data.length; i++) {
+    float32Data[i] = int16Data[i] / 32768.0;
+  }
+  return float32Data;
+};
