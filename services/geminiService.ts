@@ -1,13 +1,11 @@
-
 import { GoogleGenAI, Modality } from "@google/genai";
 import { GenerationConfig } from "../types";
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export const generateSpeechFromText = async (config: GenerationConfig, apiKey?: string): Promise<string> => {
-  // Safe access to process.env for browser environments
-  const envKey = typeof process !== 'undefined' && process.env ? process.env.API_KEY : '';
-  const keyToUse = apiKey || envKey;
+  // Use the provided API key, or fallback to the environment variable
+  const keyToUse = apiKey || process.env.API_KEY;
   
   if (!keyToUse) {
     throw new Error("API Key is missing. Please connect your Google Gemini API Key using the key icon in the top right.");
