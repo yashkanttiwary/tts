@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Play, Pause, Volume2, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, XCircle, SkipForward, Layers, StopCircle } from 'lucide-react';
+import { Play, Pause, Volume2, Loader2, AlertCircle, RefreshCcw, Sun, Moon, Sparkles, Check, Download, Layers, StopCircle, XCircle, Settings2, X, Key } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus, AudioChunk } from './types';
 import { generateSpeechFromText } from './services/geminiService';
 import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
@@ -82,10 +82,23 @@ function smartSplitText(text: string, maxLength: number): string[] {
 
 export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(false);
+  const [isMobileSettingsOpen, setIsMobileSettingsOpen] = useState(false);
+  const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
   
-  // API Key State
-  const [apiKey, setApiKey] = useState('');
-  const [isApiModalOpen, setIsApiModalOpen] = useState(false);
+  // API Key Management
+  const [apiKey, setApiKey] = useState<string>(() => {
+    return localStorage.getItem('gemini_api_key') || process.env.API_KEY || '';
+  });
+
+  const handleSaveKey = (key: string) => {
+    localStorage.setItem('gemini_api_key', key);
+    setApiKey(key);
+  };
+
+  const handleDisconnectKey = () => {
+    localStorage.removeItem('gemini_api_key');
+    setApiKey(process.env.API_KEY || '');
+  };
 
   // Content State
   const [text, setText] = useState('Welcome to the Gemini Voice Studio. I can transform any text into lifelike speech with just a click. Paste your whole book here, I will handle it chunk by chunk, streaming the audio as soon as it is ready.');
@@ -107,10 +120,8 @@ export default function App() {
   const schedulerTimerRef = useRef<number | null>(null);
   const isPlayingRef = useRef<boolean>(false);
   
-  // Load API key
+  // Load Audio Context
   useEffect(() => {
-    const storedKey = localStorage.getItem('gemini_api_key');
-    if (storedKey) setApiKey(storedKey);
     // Initialize Audio Context on user interaction usually, but here we prep ref
     const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
     if (AudioContextClass) {
@@ -134,11 +145,6 @@ export default function App() {
 
   const handleInput = () => {
     if (editorRef.current) setText(editorRef.current.innerText);
-  };
-
-  const handleSaveApiKey = (key: string) => {
-    setApiKey(key);
-    localStorage.setItem('gemini_api_key', key);
   };
 
   const stopPlayback = () => {
@@ -253,19 +259,9 @@ export default function App() {
       if (nextStartTimeRef.current - currentTime > 0.5) return;
 
       // Find the next ready chunk that hasn't been played
-      // We rely on playingChunkId to know where we are conceptually in UI, 
-      // but strictly we just need to schedule the *next* buffer.
-      // Actually, tracking which one is playing in the UI requires exact timing. 
-      // For simplicity, we'll queue them up.
+      // We rely on playingChunkId to know where we are conceptually in UI.
       
       setChunks(currentChunks => {
-        // Find first 'ready' chunk that implies it's next in line.
-        // We need a pointer. Let's use a "played" flag or just rely on 'ready' status + index.
-        // Issue: 'ready' chunks persist. We need to know which one is NEXT.
-        // Let's assume we play them in order. 
-        
-        // We'll use a ref to track index of next chunk to schedule
-        // But state updates inside setInterval are tricky.
         return currentChunks;
       });
 
@@ -273,7 +269,6 @@ export default function App() {
   }, []);
 
   // Alternative simpler Player: Watch the queue and schedule *one by one* using onended logic mock
-  // Since we want robust UI feedback, let's play Chunk X. When X finishes, Play X+1.
   useEffect(() => {
     if (status !== TTSStatus.PLAYING && status !== TTSStatus.PROCESSING) {
        // Paused or Idle, pause context?
@@ -322,16 +317,8 @@ export default function App() {
         source.playbackRate.value = playbackRate;
         source.connect(ctx.destination);
         
-        // Schedule play
-        // For gapless, we schedule at nextStartTimeRef.current
-        // BUT, if we just finished a pause, nextStartTime might be old.
-        // Simplified: Just play NOW. Gaps of 1-5ms are acceptable for "Robustness" vs complexity of exact scheduling.
-        // We will use 'onended' to trigger the next state update.
-        
         source.onended = () => {
            // Trigger next
-           // We need to trigger a re-eval. We do this by updating playingChunkId
-           // But we need to verify we aren't paused.
            if (isPlayingRef.current) {
               // Wait a tick to ensure state updates don't clash
               setTimeout(scheduleNext, 0); 
@@ -342,8 +329,7 @@ export default function App() {
         source.start(0);
         isPlayingRef.current = true;
       } else if (nextChunk.status === 'error') {
-         // Skip error chunks? or Stop?
-         // Let's skip
+         // Skip error chunks
          setPlayingChunkId(nextChunk.id); // Mark as passed
          setTimeout(scheduleNext, 100);
       } else {
@@ -358,14 +344,9 @@ export default function App() {
     } 
     // Trigger if we are stuck waiting (chunk just became ready)
     else if (isPlayingRef.current && playingChunkId) {
-       // Check if current playing is actually playing... 
-       // The onended callback handles the loop. 
-       // But if we were buffering (waiting for generation), we need to kickstart it.
        const currentIdx = chunks.findIndex(c => c.id === playingChunkId);
-       // If we are waiting for currentIdx + 1
        const nextChunk = chunks[currentIdx + 1];
        if (nextChunk && nextChunk.status === 'ready' && !isPlayingRef.current) {
-         // This implies we stalled. Restart the loop.
          scheduleNext();
        }
     }
@@ -377,8 +358,8 @@ export default function App() {
   // --- Handlers ---
 
   const handleGenerate = async () => {
-    if (!apiKey && !process.env.API_KEY) {
-      setIsApiModalOpen(true);
+    if (!apiKey) {
+      setIsApiKeyModalOpen(true);
       return;
     }
 
@@ -422,8 +403,6 @@ export default function App() {
       setStatus(chunks.some(c => c.status === 'pending' || c.status === 'generating') ? TTSStatus.PROCESSING : TTSStatus.PLAYING);
       audioContextRef.current?.resume();
       isPlayingRef.current = true;
-      // Kickstart loop if needed (if we were waiting for data)
-      // The effect hook [status] will run and trigger play logic
     }
   };
 
@@ -453,6 +432,14 @@ export default function App() {
 
   return (
     <div className={isDarkMode ? 'dark' : ''}>
+      <ApiKeyModal 
+        isOpen={isApiKeyModalOpen}
+        onClose={() => setIsApiKeyModalOpen(false)}
+        onSave={handleSaveKey}
+        onDisconnect={handleDisconnectKey}
+        hasKey={!!apiKey}
+      />
+      
       <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 font-sans selection:bg-indigo-500/30 selection:text-indigo-800 dark:selection:text-indigo-200 transition-colors duration-300">
         
         {/* Background Gradients */}
@@ -461,11 +448,12 @@ export default function App() {
           <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] rounded-full bg-purple-200/40 dark:bg-purple-900/10 blur-[100px] transition-colors duration-500"></div>
         </div>
 
-        <div className="relative z-10 max-w-7xl mx-auto px-4 py-6 md:py-10 space-y-8 flex flex-col h-screen md:h-auto">
+        {/* Updated Container Class: min-h-screen instead of h-screen to allow scrolling on mobile */}
+        <div className="relative z-10 max-w-7xl mx-auto px-4 py-4 md:py-10 space-y-6 md:space-y-8 flex flex-col min-h-screen">
           
           {/* Header */}
-          <header className="flex flex-col md:flex-row items-center justify-between gap-6 pb-2">
-            <div className="text-center md:text-left space-y-2">
+          <header className="flex flex-col md:flex-row items-center justify-between gap-4 md:gap-6 pb-2">
+            <div className="text-center md:text-left space-y-2 flex-1">
               <div className="inline-flex items-center gap-2 bg-white/80 dark:bg-slate-800/80 backdrop-blur border border-slate-200 dark:border-slate-700/50 px-3 py-1 rounded-full text-xs font-semibold text-indigo-600 dark:text-indigo-300 shadow-sm">
                 <Sparkles className="w-3.5 h-3.5" />
                 <span>Gemini 2.5 Flash TTS</span>
@@ -479,18 +467,25 @@ export default function App() {
             </div>
             
             <div className="flex items-center gap-3">
+              {/* Mobile Settings Toggle */}
               <button
-                onClick={() => setIsApiModalOpen(true)}
-                className={`
-                  flex items-center gap-2 px-4 py-2.5 rounded-full border text-sm font-medium transition-all shadow-sm
-                  ${apiKey 
-                    ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300 hover:bg-green-100 dark:hover:bg-green-900/40' 
-                    : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:border-indigo-300 dark:hover:border-slate-600'
-                  }
-                `}
+                onClick={() => setIsMobileSettingsOpen(true)}
+                className="lg:hidden px-4 py-2 rounded-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700 transition-all shadow-sm flex items-center gap-2 font-medium text-sm"
               >
-                {apiKey ? <Check className="w-4 h-4" /> : <Key className="w-4 h-4" />}
-                <span>{apiKey ? 'API Connected' : 'Connect API'}</span>
+                <Settings2 className="w-4 h-4" />
+                <span>Voice & Style</span>
+              </button>
+
+              <button
+                onClick={() => setIsApiKeyModalOpen(true)}
+                className={`p-2.5 rounded-full border transition-all shadow-sm ${
+                  apiKey 
+                    ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-600 dark:text-green-400' 
+                    : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700'
+                }`}
+                aria-label="API Key Settings"
+              >
+                <Key className="w-5 h-5" />
               </button>
 
               <button
@@ -503,10 +498,10 @@ export default function App() {
             </div>
           </header>
 
-          <main className="grid lg:grid-cols-12 gap-6 lg:h-[750px] min-h-0">
+          <main className="grid lg:grid-cols-12 gap-6 lg:h-[750px] relative">
             
-            {/* Sidebar: Controls */}
-            <aside className="lg:col-span-4 flex flex-col gap-4 min-h-0">
+            {/* Sidebar: Controls (Hidden on Mobile, Visible on Desktop) */}
+            <aside className="hidden lg:col-span-4 lg:flex flex-col gap-4 min-h-0">
               <div className="bg-white/80 dark:bg-slate-900/60 backdrop-blur-xl border border-slate-200 dark:border-slate-700/50 rounded-2xl p-6 shadow-sm dark:shadow-xl overflow-y-auto flex-1 custom-scrollbar">
                 <VoiceSelector 
                   voices={VOICES} 
@@ -523,8 +518,56 @@ export default function App() {
               </div>
             </aside>
 
+            {/* Mobile Settings Drawer */}
+            {isMobileSettingsOpen && (
+              <div className="fixed inset-0 z-50 lg:hidden flex flex-col animate-in fade-in duration-200">
+                {/* Backdrop */}
+                <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setIsMobileSettingsOpen(false)} />
+                
+                {/* Drawer Content */}
+                <div className="relative bg-slate-50 dark:bg-slate-900 h-[90%] mt-auto rounded-t-[2rem] shadow-2xl flex flex-col overflow-hidden animate-in slide-in-from-bottom duration-300">
+                   {/* Handle bar for visual cue */}
+                   <div className="w-full flex justify-center pt-3 pb-1" onClick={() => setIsMobileSettingsOpen(false)}>
+                      <div className="w-12 h-1.5 bg-slate-300 dark:bg-slate-700 rounded-full" />
+                   </div>
+
+                   <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200 dark:border-slate-800">
+                      <h2 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                         <Settings2 className="w-5 h-5 text-indigo-500" />
+                         Studio Settings
+                      </h2>
+                      <button 
+                        onClick={() => setIsMobileSettingsOpen(false)}
+                        className="p-2 rounded-full bg-slate-200 dark:bg-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-300 dark:hover:bg-slate-700"
+                      >
+                        <X className="w-5 h-5" />
+                      </button>
+                   </div>
+                   
+                   <div className="overflow-y-auto flex-1 p-6 space-y-6">
+                      <div className="space-y-4">
+                         <VoiceSelector 
+                           voices={VOICES} 
+                           selectedVoice={selectedVoice} 
+                           onSelect={setSelectedVoice}
+                           disabled={chunks.length > 0} 
+                         />
+                      </div>
+                      <div className="h-px bg-slate-200 dark:bg-slate-800" />
+                      <div className="space-y-4">
+                         <StylePresets 
+                           presets={PRESETS} 
+                           onSelect={setInstruction}
+                           disabled={chunks.length > 0}
+                         />
+                      </div>
+                   </div>
+                </div>
+              </div>
+            )}
+
             {/* Main Content: Editor & Player */}
-            <section className="lg:col-span-8 flex flex-col min-h-[500px]">
+            <section className="lg:col-span-8 flex flex-col min-h-[500px] lg:h-full">
               <div className="bg-white/90 dark:bg-slate-900/60 backdrop-blur-xl border border-slate-200 dark:border-slate-700/50 rounded-2xl shadow-lg dark:shadow-2xl flex flex-col h-full overflow-hidden transition-all">
                 
                 {/* Toolbar */}
@@ -714,17 +757,6 @@ export default function App() {
               </div>
             </section>
           </main>
-          
-          <ApiKeyModal 
-            isOpen={isApiModalOpen}
-            onClose={() => setIsApiModalOpen(false)}
-            onSave={handleSaveApiKey}
-            onDisconnect={() => {
-              setApiKey('');
-              localStorage.removeItem('gemini_api_key');
-            }}
-            hasKey={!!apiKey}
-          />
         </div>
       </div>
     </div>

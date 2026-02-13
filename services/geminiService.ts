@@ -4,11 +4,11 @@ import { GenerationConfig } from "../types";
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export const generateSpeechFromText = async (config: GenerationConfig, apiKey?: string): Promise<string> => {
-  // Prioritize user-provided key, fallback to env var
+  // Use the provided API key, or fallback to the environment variable
   const keyToUse = apiKey || process.env.API_KEY;
   
   if (!keyToUse) {
-    throw new Error("API Key is missing. Please click the 'Connect API' button in the top right to configure it.");
+    throw new Error("API Key is missing. Please connect your Google Gemini API Key using the key icon in the top right.");
   }
 
   const ai = new GoogleGenAI({ apiKey: keyToUse });
