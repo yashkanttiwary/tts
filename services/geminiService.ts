@@ -4,8 +4,17 @@ import { GenerationConfig } from "../types";
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export const generateSpeechFromText = async (config: GenerationConfig, apiKey?: string): Promise<string> => {
-  // Prioritize user-provided key, fallback to env var
-  const keyToUse = apiKey || process.env.API_KEY;
+  // Prioritize user-provided key, fallback to env var (safely checked for browser)
+  let envKey = '';
+  try {
+    if (typeof process !== 'undefined' && process.env && process.env.API_KEY) {
+      envKey = process.env.API_KEY;
+    }
+  } catch (e) {
+    // Ignore process errors in browser
+  }
+
+  const keyToUse = apiKey || envKey;
   
   if (!keyToUse) {
     throw new Error("API Key is missing. Please click the 'Connect API' button in the top right to configure it.");

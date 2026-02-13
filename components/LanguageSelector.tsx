@@ -1,5 +1,5 @@
 import React from 'react';
-import { Languages, Check } from 'lucide-react';
+import { Languages } from 'lucide-react';
 
 interface LanguageSelectorProps {
   selectedLanguage: string;

@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Play, Volume2, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge } from 'lucide-react';
+import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus } from './types';
 import { generateSpeechFromText } from './services/geminiService';
 import { pcmToWav, base64ToUint8Array, mergeBuffers } from './utils/audioUtils';
@@ -129,8 +129,15 @@ export default function App() {
   };
 
   const handleGenerate = async () => {
-    // Check for API key first
-    if (!apiKey && !process.env.API_KEY) {
+    // Check for API key safely
+    let envKey = '';
+    try {
+      if (typeof process !== 'undefined' && process.env && process.env.API_KEY) {
+        envKey = process.env.API_KEY;
+      }
+    } catch (e) {}
+
+    if (!apiKey && !envKey) {
       setIsApiModalOpen(true);
       return;
     }
