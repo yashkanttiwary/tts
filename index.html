@@ -7,6 +7,16 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <script>
+      // Polyfill process for browser compatibility with Node-centric libs like @google/genai
+      window.process = {
+        env: {
+          NODE_ENV: 'production'
+        },
+        version: '',
+        versions: {},
+        platform: 'browser'
+      };
+      
       tailwind.config = {
         darkMode: 'class',
         theme: {
