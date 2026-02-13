@@ -1,20 +1,16 @@
-import { useState, useRef, useEffect } from 'react';
-import { Play, Pause, Loader2, Sun, Moon, Sparkles, Download, StopCircle, XCircle, Settings2, X, Key, RefreshCcw } from 'lucide-react';
-import { VoiceOption, PresetOption, TTSStatus, AudioChunk } from './types';
+import React, { useState, useRef, useEffect } from 'react';
+import { Play, Volume2, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge } from 'lucide-react';
+import { VoiceOption, PresetOption, TTSStatus } from './types';
 import { generateSpeechFromText } from './services/geminiService';
-import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
+import { pcmToWav, base64ToUint8Array, mergeBuffers } from './utils/audioUtils';
 import VoiceSelector from './components/VoiceSelector';
 import StylePresets from './components/StylePresets';
 import LanguageSelector from './components/LanguageSelector';
 import ApiKeyModal from './components/ApiKeyModal';
 
-// Increased limit significantly as we now stream chunks.
-// 5 Million chars is effectively infinite for this use case.
-const MAX_CHARS = 5000000; 
-// Target size for each request (approx 1-2 paragraphs) for optimal streaming speed vs rate limits
-const IDEAL_CHUNK_SIZE = 400; 
-// Max parallel requests to Gemini API
-const MAX_CONCURRENCY = 4;
+const MAX_CHARS = 100000;
+const CHUNK_SIZE = 1000; 
+const BATCH_SIZE = 2;    
 
 const VOICES: VoiceOption[] = [
   { name: 'Puck', gender: 'Male', style: 'Upbeat & Playful', description: 'Great for storytelling and lively content.' },
@@ -31,425 +27,177 @@ const PRESETS: PresetOption[] = [
   { label: 'Whisper', prompt: 'Whisper this very quietly, intimately, and secretively:' },
 ];
 
-// Advanced splitter that respects sentence boundaries for natural pauses
-function smartSplitText(text: string, maxLength: number): string[] {
+function splitTextIdeally(text: string, maxLength: number): string[] {
   if (text.length <= maxLength) return [text];
-  
   const chunks: string[] = [];
-  let remaining = text;
-
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLength) {
-      chunks.push(remaining);
+  let currentText = text;
+  while (currentText.length > 0) {
+    if (currentText.length <= maxLength) {
+      chunks.push(currentText);
       break;
     }
-
-    // Try to split at paragraph
     let splitIndex = -1;
-    const searchBuffer = remaining.substring(0, maxLength);
-    
-    // Priority 1: Double Newlines (Paragraphs)
-    let candidate = searchBuffer.lastIndexOf('\n\n');
-    if (candidate > maxLength * 0.3) splitIndex = candidate + 2;
-
-    // Priority 2: Sentence endings (. ! ?)
-    if (splitIndex === -1) {
-       const sentenceMatches = [...searchBuffer.matchAll(/[.!?]\s/g)];
-       if (sentenceMatches.length > 0) {
-          const lastMatch = sentenceMatches[sentenceMatches.length - 1];
-          if (lastMatch.index && lastMatch.index > maxLength * 0.3) {
-             splitIndex = lastMatch.index + lastMatch[0].length;
-          }
-       }
+    const sentenceEndings = ['. ', '! ', '? ', '.\n', '!\n', '?\n', '." ', '!" ', '?" '];
+    for (let i = maxLength; i > maxLength * 0.8; i--) {
+        const char = currentText[i];
+        if (char === '\n' && currentText[i-1] === '\n') { splitIndex = i; break; }
+        if (sentenceEndings.some(end => currentText.substring(i - 1, i + end.length - 1) === end)) { splitIndex = i + 1; break; }
     }
-
-    // Priority 3: Commas or semicolons
-    if (splitIndex === -1) {
-       candidate = Math.max(searchBuffer.lastIndexOf(', '), searchBuffer.lastIndexOf('; '));
-       if (candidate > maxLength * 0.3) splitIndex = candidate + 2;
-    }
-
-    // Priority 4: Spaces
-    if (splitIndex === -1) {
-       splitIndex = searchBuffer.lastIndexOf(' ');
-       // Include the space in the first chunk
-       if (splitIndex !== -1) splitIndex += 1;
-    }
-
-    // Fallback: Hard cut
+    if (splitIndex === -1) splitIndex = currentText.lastIndexOf(' ', maxLength);
     if (splitIndex === -1) splitIndex = maxLength;
-
-    chunks.push(remaining.substring(0, splitIndex));
-    remaining = remaining.substring(splitIndex);
+    chunks.push(currentText.substring(0, splitIndex).trim());
+    currentText = currentText.substring(splitIndex).trim();
   }
-  
   return chunks;
 }
 
 export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(false);
-  const [isMobileSettingsOpen, setIsMobileSettingsOpen] = useState(false);
-  const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
   
-  // API Key Management
-  const [apiKey, setApiKey] = useState<string>(() => {
-    return localStorage.getItem('gemini_api_key') || process.env.API_KEY || '';
-  });
+  // API Key State
+  const [apiKey, setApiKey] = useState('');
+  const [isApiModalOpen, setIsApiModalOpen] = useState(false);
 
-  const handleSaveKey = (key: string) => {
-    localStorage.setItem('gemini_api_key', key);
-    setApiKey(key);
-  };
-
-  const handleDisconnectKey = () => {
-    localStorage.removeItem('gemini_api_key');
-    setApiKey(process.env.API_KEY || '');
-  };
-
-  // Content State - Simplified default text to prevent duplication confusion
-  const [text, setText] = useState('Welcome to the Gemini Voice Studio. I can transform any text into lifelike speech.');
+  // We use this state to track plain text for the API and character count
+  const [text, setText] = useState('Welcome to the Gemini Voice Studio. I can transform any text into lifelike speech.\n\nSelect Hindi from the menu to hear me speak in a native Indian accent. I will highlight the text as I read it.');
+  
   const [instruction, setInstruction] = useState('');
   const [selectedVoice, setSelectedVoice] = useState('Puck');
   const [selectedLanguage, setSelectedLanguage] = useState('en');
-  
-  // Queue & Playback State
-  const [chunks, setChunks] = useState<AudioChunk[]>([]);
   const [status, setStatus] = useState<TTSStatus>(TTSStatus.IDLE);
-  const [playingChunkId, setPlayingChunkId] = useState<string | null>(null);
-  const [playbackRate, setPlaybackRate] = useState(1.0);
+  const [progressMessage, setProgressMessage] = useState('');
   const [error, setError] = useState('');
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [playbackRate, setPlaybackRate] = useState(1.0);
   
-  // Refs
+  const audioRef = useRef<HTMLAudioElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
-  const activeChunkRef = useRef<HTMLSpanElement>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const schedulerTimerRef = useRef<number | null>(null);
-  const isPlayingRef = useRef<boolean>(false);
-  
-  // Load Audio Context
+
+  // Load API key from local storage on mount
   useEffect(() => {
-    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-    if (AudioContextClass) {
-      audioContextRef.current = new AudioContextClass({ sampleRate: 24000 });
-    }
+    const storedKey = localStorage.getItem('gemini_api_key');
+    if (storedKey) setApiKey(storedKey);
   }, []);
 
-  // Cleanup on unmount
   useEffect(() => {
-    return () => {
-      stopPlayback();
-    };
-  }, []);
+    return () => { if (audioUrl) URL.revokeObjectURL(audioUrl); };
+  }, [audioUrl]);
 
-  // Editor Sync - Robust check to prevent appending on double-render
+  // Handle auto-play and playback rate application
   useEffect(() => {
-    if (editorRef.current && text) {
-      // Only set if completely empty to avoid duplication logic
-      if (!editorRef.current.innerText.trim()) {
-        editorRef.current.innerText = text;
+    if (audioRef.current) {
+      audioRef.current.playbackRate = playbackRate;
+      
+      if (status === TTSStatus.SUCCESS && audioUrl) {
+        audioRef.current.play().catch(e => console.log("Auto-play blocked"));
       }
     }
-  }, []);
+  }, [status, audioUrl, playbackRate]);
 
-  // Auto-scroll to active chunk
+  // Initial content setup
   useEffect(() => {
-    if (activeChunkRef.current) {
-      activeChunkRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (editorRef.current && text && editorRef.current.innerText === '') {
+      editorRef.current.innerText = text;
     }
-  }, [playingChunkId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleInput = () => {
-    if (editorRef.current) setText(editorRef.current.innerText);
+    if (editorRef.current) {
+      setText(editorRef.current.innerText);
+    }
   };
 
-  const stopPlayback = () => {
-    // Stop API generation
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-    // Stop Audio
-    if (audioContextRef.current) {
-      audioContextRef.current.close().then(() => {
-         const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-         audioContextRef.current = new AudioContextClass({ sampleRate: 24000 });
-      });
-    }
-    if (schedulerTimerRef.current) {
-      window.clearInterval(schedulerTimerRef.current);
-      schedulerTimerRef.current = null;
-    }
-    
-    setStatus(TTSStatus.IDLE);
-    setPlayingChunkId(null);
-    isPlayingRef.current = false;
+  const handleSaveApiKey = (key: string) => {
+    setApiKey(key);
+    localStorage.setItem('gemini_api_key', key);
   };
 
-  const handleReset = () => {
-    stopPlayback();
-    setChunks([]);
-    setError('');
+  const handleDisconnectApiKey = () => {
+    setApiKey('');
+    localStorage.removeItem('gemini_api_key');
   };
 
-  // --- Core Logic: Parallel Generator Loop ---
-  useEffect(() => {
-    const processQueue = async () => {
-      // 1. Guard Clauses: Only process if active
-      if (status !== TTSStatus.PROCESSING && status !== TTSStatus.PLAYING) return;
-      
-      // 2. Parallelism Logic: Check available slots
-      const generatingCount = chunks.filter(c => c.status === 'generating').length;
-      if (generatingCount >= MAX_CONCURRENCY) return;
-      
-      const slotsAvailable = MAX_CONCURRENCY - generatingCount;
-      
-      // 3. Find pending chunks
-      const pendingCandidates = chunks
-        .map((c, i) => ({ ...c, index: i }))
-        .filter(c => c.status === 'pending')
-        .slice(0, slotsAvailable);
-
-      if (pendingCandidates.length === 0) return;
-
-      // 4. Mark as generating immediately to prevent duplicate scheduling
-      setChunks(prev => {
-        const next = [...prev];
-        pendingCandidates.forEach(pc => {
-          next[pc.index] = { ...next[pc.index], status: 'generating' };
-        });
-        return next;
-      });
-
-      // 5. Execution Loop
-      pendingCandidates.forEach(async (candidateWrapper) => {
-        const i = candidateWrapper.index;
-        const chunk = chunks[i]; // Access from closure, text is stable
-        
-        // Skip whitespace-only chunks
-        if (!chunk.text.trim()) {
-           setChunks(prev => prev.map((c, idx) => 
-             idx === i ? { ...c, status: 'ready', duration: 0, audioData: new Float32Array(0) } : c
-           ));
-           return;
-        }
-
-        // Context: Grab the last 150 chars of the previous chunk to maintain flow
-        const previousChunk = i > 0 ? chunks[i - 1] : null;
-        const previousText = previousChunk ? previousChunk.text.slice(-150) : '';
-
-        try {
-          const base64Audio = await generateSpeechFromText({
-            text: chunk.text,
-            instruction,
-            voice: selectedVoice,
-            language: selectedLanguage,
-            previousText
-          }, apiKey);
-
-          const rawPcm = base64ToUint8Array(base64Audio);
-          const audioFloat32 = convertInt16ToFloat32(rawPcm);
-          const duration = audioFloat32.length / 24000;
-
-          setChunks(prev => prev.map((c, idx) => 
-            idx === i 
-              ? { ...c, status: 'ready', rawPcm, audioData: audioFloat32, duration } 
-              : c
-          ));
-
-        } catch (err: any) {
-          console.error("Chunk failed", err);
-          setChunks(prev => prev.map((c, idx) => 
-            idx === i 
-              ? { ...c, status: 'error', error: err.message || "Failed" } 
-              : c
-          ));
-          
-          if (err.message && (err.message.includes("API Key") || err.message.includes("403"))) {
-             setIsApiKeyModalOpen(true);
-             setStatus(TTSStatus.PAUSED);
-          }
-        }
-      });
-    };
-
-    processQueue();
-  }, [chunks, status, apiKey, instruction, selectedVoice, selectedLanguage]);
-
-
-  // --- Core Logic: Audio Player ---
-  useEffect(() => {
-    if (status !== TTSStatus.PLAYING && status !== TTSStatus.PROCESSING) {
-       if (audioContextRef.current?.state === 'running') {
-         audioContextRef.current.suspend();
-       }
-       return;
-    }
-
-    if (audioContextRef.current?.state === 'suspended') {
-      audioContextRef.current.resume();
-    }
-
-    const scheduleNext = () => {
-      const ctx = audioContextRef.current;
-      if (!ctx) return;
-
-      // Determine next chunk index
-      let nextIndex = 0;
-      if (playingChunkId) {
-        const currentIdx = chunks.findIndex(c => c.id === playingChunkId);
-        if (currentIdx !== -1) nextIndex = currentIdx + 1;
-      }
-
-      if (nextIndex >= chunks.length) {
-         if (status === TTSStatus.PROCESSING || chunks.some(c => c.status === 'pending' || c.status === 'generating')) {
-            // Still waiting for generation
-            return;
-         }
-         setStatus(TTSStatus.COMPLETED);
-         setPlayingChunkId(null);
-         return;
-      }
-
-      const nextChunk = chunks[nextIndex];
-
-      if (nextChunk.status === 'ready' && nextChunk.audioData) {
-        // Handle silent chunks (whitespace) immediately
-        if (nextChunk.audioData.length === 0) {
-            setPlayingChunkId(nextChunk.id);
-            // Instant transition
-            setTimeout(scheduleNext, 50);
-            return;
-        }
-
-        const buffer = ctx.createBuffer(1, nextChunk.audioData.length, 24000);
-        buffer.getChannelData(0).set(nextChunk.audioData);
-        
-        const source = ctx.createBufferSource();
-        source.buffer = buffer;
-        source.playbackRate.value = playbackRate;
-        source.connect(ctx.destination);
-        
-        source.onended = () => {
-           if (isPlayingRef.current) {
-              setTimeout(scheduleNext, 0); 
-           }
-        };
-
-        setPlayingChunkId(nextChunk.id);
-        source.start(0);
-        isPlayingRef.current = true;
-      } else if (nextChunk.status === 'error') {
-         setPlayingChunkId(nextChunk.id); 
-         setTimeout(scheduleNext, 100);
-      }
-    };
-    
-    if (!isPlayingRef.current && playingChunkId === null && chunks.length > 0) {
-       scheduleNext();
-    } 
-    else if (isPlayingRef.current && playingChunkId) {
-       const currentIdx = chunks.findIndex(c => c.id === playingChunkId);
-       const nextChunk = chunks[currentIdx + 1];
-       if (nextChunk && nextChunk.status === 'ready' && !isPlayingRef.current) {
-         scheduleNext();
-       }
-    }
-  }, [chunks, status, playbackRate]);
-
-
-  // --- Handlers ---
+  const handleDownload = () => {
+    if (!audioUrl) return;
+    const link = document.createElement('a');
+    link.href = audioUrl;
+    link.download = `gemini-speech-${Date.now()}.wav`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
 
   const handleGenerate = async () => {
-    if (!apiKey) {
-      setIsApiKeyModalOpen(true);
+    // Check for API key first
+    if (!apiKey && !process.env.API_KEY) {
+      setIsApiModalOpen(true);
       return;
     }
 
     const currentText = editorRef.current?.innerText || text;
+    
     if (!currentText.trim()) return;
+    if (currentText.length > MAX_CHARS) {
+      setError(`Text exceeds limit of ${MAX_CHARS.toLocaleString()} characters.`);
+      return;
+    }
 
-    handleReset();
+    setStatus(TTSStatus.GENERATING);
     setError('');
+    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    setAudioUrl(null);
 
-    // 1. Split Text
-    const textSegments = smartSplitText(currentText, IDEAL_CHUNK_SIZE);
-    
-    // 2. Initialize Queue
-    const newChunks: AudioChunk[] = textSegments.map((seg, i) => ({
-      id: `chunk-${Date.now()}-${i}`,
-      text: seg,
-      status: 'pending'
-    }));
-    
-    setChunks(newChunks);
-    setStatus(TTSStatus.PROCESSING);
-    isPlayingRef.current = false;
-    
-    // Initialize Audio Context if needed
-    if (!audioContextRef.current) {
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      audioContextRef.current = new AudioContextClass({ sampleRate: 24000 });
+    try {
+      const chunks = splitTextIdeally(currentText, CHUNK_SIZE);
+      const pcmChunks: Uint8Array[] = new Array(chunks.length);
+
+      const totalBatches = Math.ceil(chunks.length / BATCH_SIZE);
+
+      for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+        const batchSlice = chunks.slice(i, i + BATCH_SIZE);
+        const currentBatchIndex = Math.floor(i / BATCH_SIZE) + 1;
+        
+        setProgressMessage(`Synthesizing batch ${currentBatchIndex} of ${totalBatches}...`);
+
+        const batchPromises = batchSlice.map((chunk, idx) => {
+          const globalIndex = i + idx;
+          return generateSpeechFromText({
+            text: chunk,
+            instruction,
+            voice: selectedVoice,
+            language: selectedLanguage
+          }, apiKey).then(base64 => ({ index: globalIndex, data: base64ToUint8Array(base64) }));
+        });
+
+        const results = await Promise.all(batchPromises);
+        
+        results.forEach(res => {
+          pcmChunks[res.index] = res.data;
+        });
+      }
+
+      setProgressMessage('Finalizing audio...');
+      const mergedPcm = mergeBuffers(pcmChunks);
+      const wavBuffer = pcmToWav(mergedPcm.buffer);
+      const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+      const url = URL.createObjectURL(blob);
+      
+      setAudioUrl(url);
+      setStatus(TTSStatus.SUCCESS);
+      setProgressMessage('');
+
+    } catch (err: any) {
+      setError(err.message || "An unexpected error occurred.");
+      setStatus(TTSStatus.ERROR);
+      setProgressMessage('');
     }
-    if (audioContextRef.current.state === 'suspended') {
-      await audioContextRef.current.resume();
-    }
   };
 
-  const togglePlayPause = () => {
-    if (status === TTSStatus.PLAYING || status === TTSStatus.PROCESSING) {
-      setStatus(TTSStatus.PAUSED);
-      audioContextRef.current?.suspend();
-      isPlayingRef.current = false;
-    } else if (status === TTSStatus.PAUSED) {
-      // Resume
-      setStatus(chunks.some(c => c.status === 'pending' || c.status === 'generating') ? TTSStatus.PROCESSING : TTSStatus.PLAYING);
-      audioContextRef.current?.resume();
-      isPlayingRef.current = true;
-    }
-  };
-
-  const handleDownloadFull = () => {
-    const readyChunks = chunks.filter(c => c.status === 'ready' && c.rawPcm && c.rawPcm.length > 0);
-    if (readyChunks.length === 0) return;
-    
-    const buffers = readyChunks.map(c => c.rawPcm!);
-    const merged = mergeBuffers(buffers);
-    const wav = pcmToWav(merged.buffer as ArrayBuffer);
-    const blob = new Blob([wav], { type: 'audio/wav' });
-    const url = URL.createObjectURL(blob);
-    
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `gemini-full-speech.wav`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  };
-
-  const handleRetryChunk = (chunkIndex: number) => {
-     setChunks(prev => prev.map((c, i) => i === chunkIndex ? { ...c, status: 'pending', error: undefined } : c));
-     if (status !== TTSStatus.PLAYING) {
-        setStatus(TTSStatus.PROCESSING);
-     }
-  };
-
-  const completedCount = chunks.filter(c => c.status === 'ready').length;
-  const totalCount = chunks.length;
-  const progressPercent = totalCount > 0 ? (completedCount / totalCount) * 100 : 0;
-  const isGenerating = status === TTSStatus.PROCESSING || chunks.some(c => c.status === 'generating');
+  const isLoading = status === TTSStatus.GENERATING;
 
   return (
     <div className={isDarkMode ? 'dark' : ''}>
-      <ApiKeyModal 
-        isOpen={isApiKeyModalOpen}
-        onClose={() => setIsApiKeyModalOpen(false)}
-        onSave={handleSaveKey}
-        onDisconnect={handleDisconnectKey}
-        hasKey={!!apiKey}
-      />
-      
       <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 font-sans selection:bg-indigo-500/30 selection:text-indigo-800 dark:selection:text-indigo-200 transition-colors duration-300">
         
         {/* Background Gradients */}
@@ -458,12 +206,11 @@ export default function App() {
           <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] rounded-full bg-purple-200/40 dark:bg-purple-900/10 blur-[100px] transition-colors duration-500"></div>
         </div>
 
-        {/* Container */}
-        <div className="relative z-10 max-w-7xl mx-auto px-4 py-4 md:py-10 space-y-6 md:space-y-8 flex flex-col min-h-screen">
+        <div className="relative z-10 max-w-7xl mx-auto px-4 py-6 md:py-10 space-y-8 flex flex-col h-screen md:h-auto">
           
           {/* Header */}
-          <header className="flex flex-col md:flex-row items-center justify-between gap-4 md:gap-6 pb-2">
-            <div className="text-center md:text-left space-y-2 flex-1">
+          <header className="flex flex-col md:flex-row items-center justify-between gap-6 pb-2">
+            <div className="text-center md:text-left space-y-2">
               <div className="inline-flex items-center gap-2 bg-white/80 dark:bg-slate-800/80 backdrop-blur border border-slate-200 dark:border-slate-700/50 px-3 py-1 rounded-full text-xs font-semibold text-indigo-600 dark:text-indigo-300 shadow-sm">
                 <Sparkles className="w-3.5 h-3.5" />
                 <span>Gemini 2.5 Flash TTS</span>
@@ -472,49 +219,45 @@ export default function App() {
                 Gemini Voice Studio
               </h1>
               <p className="text-slate-500 dark:text-slate-400 text-sm md:text-base max-w-lg">
-                Pro-grade streaming TTS. Infinite length. Context-aware generation.
+                Create lifelike speech with emotional intelligence.
               </p>
             </div>
             
             <div className="flex items-center gap-3">
               <button
-                onClick={() => setIsMobileSettingsOpen(true)}
-                className="lg:hidden px-4 py-2 rounded-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700 transition-all shadow-sm flex items-center gap-2 font-medium text-sm"
+                onClick={() => setIsApiModalOpen(true)}
+                className={`
+                  flex items-center gap-2 px-4 py-2.5 rounded-full border text-sm font-medium transition-all shadow-sm
+                  ${apiKey 
+                    ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300 hover:bg-green-100 dark:hover:bg-green-900/40' 
+                    : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:border-indigo-300 dark:hover:border-slate-600'
+                  }
+                `}
               >
-                <Settings2 className="w-4 h-4" />
-                <span>Voice & Style</span>
-              </button>
-
-              <button
-                onClick={() => setIsApiKeyModalOpen(true)}
-                className={`p-2.5 rounded-full border transition-all shadow-sm ${
-                  apiKey 
-                    ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-600 dark:text-green-400' 
-                    : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700'
-                }`}
-              >
-                <Key className="w-5 h-5" />
+                {apiKey ? <Check className="w-4 h-4" /> : <Key className="w-4 h-4" />}
+                <span>{apiKey ? 'API Connected' : 'Connect API'}</span>
               </button>
 
               <button
                 onClick={() => setIsDarkMode(!isDarkMode)}
                 className="p-2.5 rounded-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700 transition-all shadow-sm"
+                aria-label="Toggle theme"
               >
                 {isDarkMode ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
               </button>
             </div>
           </header>
 
-          <main className="grid lg:grid-cols-12 gap-6 lg:h-[750px] relative">
+          <main className="grid lg:grid-cols-12 gap-6 lg:h-[750px] min-h-0">
             
             {/* Sidebar: Controls */}
-            <aside className="hidden lg:col-span-4 lg:flex flex-col gap-4 min-h-0">
+            <aside className="lg:col-span-4 flex flex-col gap-4 min-h-0">
               <div className="bg-white/80 dark:bg-slate-900/60 backdrop-blur-xl border border-slate-200 dark:border-slate-700/50 rounded-2xl p-6 shadow-sm dark:shadow-xl overflow-y-auto flex-1 custom-scrollbar">
                 
                 <LanguageSelector 
                   selectedLanguage={selectedLanguage}
                   onSelect={setSelectedLanguage}
-                  disabled={chunks.length > 0}
+                  disabled={isLoading}
                 />
                 <div className="h-px bg-slate-200 dark:bg-slate-800 my-6" />
 
@@ -522,63 +265,31 @@ export default function App() {
                   voices={VOICES} 
                   selectedVoice={selectedVoice} 
                   onSelect={setSelectedVoice}
-                  disabled={chunks.length > 0} 
+                  disabled={isLoading} 
                 />
                 <div className="h-px bg-slate-200 dark:bg-slate-800 my-6" />
                 <StylePresets 
                   presets={PRESETS} 
                   onSelect={setInstruction}
-                  disabled={chunks.length > 0}
+                  disabled={isLoading}
                 />
+              </div>
+              
+              <div className="bg-gradient-to-br from-indigo-50 to-purple-50 dark:from-indigo-900/20 dark:to-purple-900/20 border border-indigo-100 dark:border-indigo-500/10 rounded-xl p-4 flex gap-3 items-start shrink-0">
+                 <div className="bg-indigo-100 dark:bg-indigo-500/20 p-2 rounded-lg shrink-0">
+                   <Wand2 className="w-4 h-4 text-indigo-600 dark:text-indigo-300" />
+                 </div>
+                 <div>
+                   <h3 className="text-sm font-bold text-indigo-900 dark:text-indigo-200 mb-1">Rich Text Ready</h3>
+                   <p className="text-xs text-indigo-700/80 dark:text-indigo-300/70 leading-relaxed">
+                     Paste your formatted text directly. We preserve the look while generating seamless audio from the content.
+                   </p>
+                 </div>
               </div>
             </aside>
 
-            {/* Mobile Settings Drawer */}
-            {isMobileSettingsOpen && (
-              <div className="fixed inset-0 z-50 lg:hidden flex flex-col animate-in fade-in duration-200">
-                <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setIsMobileSettingsOpen(false)} />
-                <div className="relative bg-slate-50 dark:bg-slate-900 h-[90%] mt-auto rounded-t-[2rem] shadow-2xl flex flex-col overflow-hidden animate-in slide-in-from-bottom duration-300">
-                   <div className="w-full flex justify-center pt-3 pb-1" onClick={() => setIsMobileSettingsOpen(false)}>
-                      <div className="w-12 h-1.5 bg-slate-300 dark:bg-slate-700 rounded-full" />
-                   </div>
-                   <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200 dark:border-slate-800">
-                      <h2 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
-                         <Settings2 className="w-5 h-5 text-indigo-500" />
-                         Studio Settings
-                      </h2>
-                      <button 
-                        onClick={() => setIsMobileSettingsOpen(false)}
-                        className="p-2 rounded-full bg-slate-200 dark:bg-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-300 dark:hover:bg-slate-700"
-                      >
-                        <X className="w-5 h-5" />
-                      </button>
-                   </div>
-                   <div className="overflow-y-auto flex-1 p-6 space-y-6">
-                      <LanguageSelector 
-                          selectedLanguage={selectedLanguage}
-                          onSelect={setSelectedLanguage}
-                          disabled={chunks.length > 0}
-                        />
-                      <div className="h-px bg-slate-200 dark:bg-slate-800" />
-                      <VoiceSelector 
-                           voices={VOICES} 
-                           selectedVoice={selectedVoice} 
-                           onSelect={setSelectedVoice}
-                           disabled={chunks.length > 0} 
-                         />
-                      <div className="h-px bg-slate-200 dark:bg-slate-800" />
-                      <StylePresets 
-                           presets={PRESETS} 
-                           onSelect={setInstruction}
-                           disabled={chunks.length > 0}
-                         />
-                   </div>
-                </div>
-              </div>
-            )}
-
             {/* Main Content: Editor & Player */}
-            <section className="lg:col-span-8 flex flex-col min-h-[500px] lg:h-full">
+            <section className="lg:col-span-8 flex flex-col min-h-[500px]">
               <div className="bg-white/90 dark:bg-slate-900/60 backdrop-blur-xl border border-slate-200 dark:border-slate-700/50 rounded-2xl shadow-lg dark:shadow-2xl flex flex-col h-full overflow-hidden transition-all">
                 
                 {/* Toolbar */}
@@ -589,187 +300,145 @@ export default function App() {
                         value={instruction}
                         onChange={(e) => setInstruction(e.target.value)}
                         placeholder="Style Direction (e.g. 'Whisper urgently...')"
-                        disabled={chunks.length > 0}
+                        disabled={isLoading}
                         className="w-full bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-900 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 placeholder:text-slate-400 dark:placeholder:text-slate-600 transition-all shadow-sm"
                      />
                   </div>
-                  
-                  {chunks.length > 0 && (
-                     <div className="flex items-center gap-2">
-                       {isGenerating && (
-                         <div className="flex items-center gap-1.5 text-xs font-medium text-amber-600 dark:text-amber-400 animate-pulse px-2">
-                            <Loader2 className="w-3 h-3 animate-spin" />
-                            Generating...
-                         </div>
-                       )}
-                     </div>
-                  )}
-
                   <div className={`text-[10px] md:text-xs font-mono font-medium px-2.5 py-1.5 rounded-md border 
                     ${text.length > MAX_CHARS 
                       ? 'text-red-600 dark:text-red-400 border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-900/10' 
-                      : 'text-slate-500 dark:text-slate-400 border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800'}
+                      : text.length > MAX_CHARS * 0.9 
+                        ? 'text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10' 
+                        : 'text-slate-500 dark:text-slate-400 border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800'}
                   `}>
-                    {text.length.toLocaleString()} chars
+                    {text.length.toLocaleString()} / {MAX_CHARS.toLocaleString()}
                   </div>
                 </div>
 
-                {/* Queue Visualization Overlay */}
-                {chunks.length > 0 && (
-                  <div className="w-full h-1 bg-slate-200 dark:bg-slate-800 overflow-hidden">
-                    <div 
-                      className="h-full bg-indigo-500 transition-all duration-300 ease-out"
-                      style={{ width: `${progressPercent}%` }}
-                    />
+                {/* Editor */}
+                <div className="flex-1 relative min-h-0 z-10 group bg-transparent">
+                  <div
+                    ref={editorRef}
+                    contentEditable={!isLoading}
+                    onInput={handleInput}
+                    data-placeholder="Enter or paste your text here..."
+                    className="rich-text-editor w-full h-full p-6 text-base md:text-lg leading-loose text-slate-800 dark:text-slate-200 focus:outline-none custom-scrollbar"
+                    suppressContentEditableWarning={true}
+                  />
+                </div>
+
+                {/* Error Banner */}
+                {error && (
+                  <div className="bg-red-50 dark:bg-red-900/20 border-y border-red-200 dark:border-red-900/30 px-6 py-3 flex items-center gap-3 animate-in slide-in-from-bottom-2 fade-in z-20 shrink-0">
+                    <AlertCircle className="w-5 h-5 text-red-600 dark:text-red-400 shrink-0" />
+                    <p className="text-sm text-red-700 dark:text-red-300 font-medium">{error}</p>
+                    <button onClick={() => setError('')} className="ml-auto text-red-500 hover:text-red-700 dark:hover:text-red-200 text-sm font-medium">
+                      Dismiss
+                    </button>
                   </div>
                 )}
 
-                {/* Editor Area */}
-                <div className="flex-1 relative min-h-0 z-10 group bg-transparent flex flex-col">
-                  {/* PLAYBACK MODE: Seamless Document View */}
-                  {chunks.length > 0 ? (
-                    <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-4 custom-scrollbar scroll-smooth">
-                      <div className="text-base md:text-lg leading-loose text-slate-700 dark:text-slate-300 whitespace-pre-wrap font-sans">
-                        {chunks.map((chunk) => {
-                          const isActive = chunk.id === playingChunkId;
-                          return (
-                            <span 
-                              key={chunk.id}
-                              ref={isActive ? activeChunkRef : null}
-                              className={`
-                                transition-all duration-300 rounded px-0.5 py-0.5 box-decoration-clone
-                                ${isActive 
-                                  ? 'bg-indigo-200 dark:bg-indigo-900/60 text-indigo-900 dark:text-indigo-100 shadow-sm' 
-                                  : ''
-                                }
-                                ${chunk.status === 'error' 
-                                  ? 'bg-red-100 dark:bg-red-900/30 text-red-800 dark:text-red-200 decoration-red-500 underline decoration-wavy' 
-                                  : ''
-                                }
-                              `}
-                              title={chunk.status === 'error' ? 'Failed to load audio' : undefined}
-                            >
-                              {chunk.text}
-                            </span>
-                          );
-                        })}
-                      </div>
-                      
-                      {/* Retry Button for Errors (Global) */}
-                      {chunks.some(c => c.status === 'error') && (
-                        <div className="flex justify-center pt-8 pb-4">
-                           <button 
-                             onClick={() => chunks.forEach((c, i) => c.status === 'error' && handleRetryChunk(i))}
-                             className="flex items-center gap-2 px-4 py-2 bg-red-50 text-red-600 rounded-full border border-red-200 hover:bg-red-100 transition-colors text-sm font-medium"
-                           >
-                             <RefreshCcw className="w-4 h-4" />
-                             Retry Failed Segments
-                           </button>
+                {/* Action Bar */}
+                <div className="p-4 md:p-6 bg-slate-50/80 dark:bg-slate-800/30 border-t border-slate-200 dark:border-slate-700/50 flex flex-col md:flex-row items-center gap-4 md:gap-6 z-20 shrink-0">
+                  
+                  {/* Player Interface */}
+                  <div className={`flex-1 w-full bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm transition-all overflow-hidden ${status === TTSStatus.SUCCESS ? 'p-0' : 'p-2 flex items-center min-h-[56px]'}`}>
+                    {status === TTSStatus.SUCCESS && audioUrl ? (
+                      <div className="w-full flex flex-col">
+                        <audio 
+                          ref={audioRef}
+                          controls 
+                          src={audioUrl} 
+                          className="w-full h-12 block focus:outline-none" 
+                        />
+                        
+                        {/* Audio Controls Toolbar */}
+                        <div className="flex flex-wrap items-center justify-between gap-4 px-4 py-3 bg-slate-50/50 dark:bg-slate-800/30 border-t border-slate-100 dark:border-slate-800">
+                          
+                          {/* Speed Controls */}
+                          <div className="flex items-center gap-3">
+                            <div className="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
+                              <Gauge className="w-4 h-4" />
+                              <span className="text-xs font-bold uppercase tracking-wider">Speed</span>
+                            </div>
+                            <div className="flex items-center bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700 p-0.5">
+                              {[0.75, 1, 1.25, 1.5, 2].map((rate) => (
+                                <button
+                                  key={rate}
+                                  onClick={() => setPlaybackRate(rate)}
+                                  className={`
+                                    px-2.5 py-1 text-xs font-medium rounded-md transition-all
+                                    ${playbackRate === rate 
+                                      ? 'bg-indigo-100 dark:bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 shadow-sm' 
+                                      : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700/50'
+                                    }
+                                  `}
+                                >
+                                  {rate}x
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* Download Button */}
+                          <button 
+                            onClick={handleDownload}
+                            className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-indigo-300 dark:hover:border-indigo-500/50 text-slate-600 dark:text-slate-300 hover:text-indigo-600 dark:hover:text-indigo-400 text-xs font-bold transition-all shadow-sm hover:shadow"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span>Download WAV</span>
+                          </button>
                         </div>
-                      )}
-                      
-                      <div className="h-24" />
-                    </div>
-                  ) : (
-                    /* EDIT MODE: Rich Text Editor */
-                    <div
-                      ref={editorRef}
-                      contentEditable={true}
-                      onInput={handleInput}
-                      data-placeholder="Enter or paste your text here..."
-                      className="rich-text-editor w-full h-full p-6 md:p-8 text-base md:text-lg leading-loose text-slate-800 dark:text-slate-200 focus:outline-none custom-scrollbar"
-                      suppressContentEditableWarning={true}
-                    />
-                  )}
-                </div>
-
-                {/* Controls Area */}
-                <div className="p-4 md:p-6 bg-slate-50/80 dark:bg-slate-800/30 border-t border-slate-200 dark:border-slate-700/50 flex flex-col gap-4 z-20 shrink-0 backdrop-blur-md">
-                  {error && (
-                     <div className="flex items-center justify-between text-xs text-red-600 bg-red-50 dark:bg-red-900/20 p-2 rounded-lg border border-red-100 dark:border-red-800 mb-2">
-                       <span>{error}</span>
-                       <button onClick={() => setError('')}><XCircle className="w-4 h-4" /></button>
-                     </div>
-                  )}
-
-                  <div className="flex flex-col md:flex-row items-center gap-4">
-                    
-                    {/* Playback Controls */}
-                    {chunks.length > 0 ? (
-                      <div className="flex-1 w-full flex items-center gap-4 bg-white dark:bg-slate-900 p-2 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
-                         <button
-                           onClick={togglePlayPause}
-                           className="w-12 h-12 flex items-center justify-center rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white shadow-md transition-all active:scale-95"
-                         >
-                           {status === TTSStatus.PLAYING || status === TTSStatus.PROCESSING ? (
-                             <Pause className="w-5 h-5 fill-current" />
-                           ) : (
-                             <Play className="w-5 h-5 fill-current ml-0.5" />
-                           )}
-                         </button>
-
-                         <div className="flex-1 flex flex-col justify-center gap-1">
-                           <div className="text-sm font-semibold text-slate-700 dark:text-slate-200">
-                              {status === TTSStatus.COMPLETED ? 'Playback Complete' : status === TTSStatus.PAUSED ? 'Paused' : 'Playing...'}
-                           </div>
-                           <div className="text-xs text-slate-500 dark:text-slate-400 font-mono">
-                             {completedCount}/{totalCount} segments
-                           </div>
-                         </div>
-
-                         <div className="h-8 w-px bg-slate-200 dark:bg-slate-700 mx-2" />
-
-                         <div className="flex items-center gap-1">
-                            {[1, 1.25, 1.5, 2].map(rate => (
-                              <button
-                                key={rate}
-                                onClick={() => setPlaybackRate(rate)}
-                                className={`text-[10px] font-bold px-2 py-1 rounded ${playbackRate === rate ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900 dark:text-indigo-300' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800'}`}
-                              >
-                                {rate}x
-                              </button>
-                            ))}
-                         </div>
-                         
-                         <button 
-                           onClick={handleReset}
-                           className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
-                           title="Stop & Clear"
-                         >
-                           <StopCircle className="w-5 h-5" />
-                         </button>
                       </div>
                     ) : (
-                      <button
-                        onClick={handleGenerate}
-                        disabled={!text.trim()}
-                        className={`
-                          w-full flex-1 px-8 py-4 rounded-xl font-bold text-white shadow-lg flex items-center justify-center gap-3 transition-all transform
-                          ${!text.trim()
-                            ? 'bg-slate-300 dark:bg-slate-700 cursor-not-allowed opacity-70 shadow-none' 
-                            : 'bg-indigo-600 hover:bg-indigo-500 hover:scale-[1.01] active:scale-[0.99] shadow-indigo-500/20'
-                          }
-                        `}
-                      >
-                        <Play className="w-5 h-5 fill-current" />
-                        <span className="text-lg">Generate Speech</span>
-                      </button>
-                    )}
-
-                    {completedCount > 0 && (
-                      <button 
-                        onClick={handleDownloadFull}
-                        className="px-5 py-4 rounded-xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-indigo-500 dark:hover:border-indigo-400 text-slate-700 dark:text-slate-200 font-semibold shadow-sm hover:shadow-md transition-all flex items-center gap-2"
-                      >
-                        <Download className="w-5 h-5" />
-                        <span className="hidden md:inline">Download Full WAV</span>
-                      </button>
+                      <div className="w-full text-center text-sm text-slate-500 dark:text-slate-500 italic flex items-center justify-center gap-2">
+                         {isLoading ? (
+                           <div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400">
+                             <span className="animate-pulse font-medium">{progressMessage || 'Initializing...'}</span>
+                           </div>
+                         ) : (
+                           'Ready to generate'
+                         )}
+                      </div>
                     )}
                   </div>
+
+                  {/* Generate Button */}
+                  <button
+                    onClick={handleGenerate}
+                    disabled={isLoading || !text.trim()}
+                    className={`
+                      w-full md:w-auto px-8 py-3.5 rounded-xl font-bold text-white shadow-lg flex items-center justify-center gap-2.5 transition-all transform
+                      ${isLoading || !text.trim()
+                        ? 'bg-slate-300 dark:bg-slate-700 cursor-not-allowed opacity-70 shadow-none' 
+                        : 'bg-indigo-600 hover:bg-indigo-500 dark:bg-gradient-to-r dark:from-indigo-600 dark:to-purple-600 dark:hover:from-indigo-500 dark:hover:to-purple-500 hover:scale-[1.02] active:scale-[0.98] shadow-indigo-500/20'
+                      }
+                    `}
+                  >
+                    {isLoading ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        <span>Processing</span>
+                      </>
+                    ) : (
+                      <>
+                        {status === TTSStatus.SUCCESS ? <RefreshCcw className="w-5 h-5" /> : <Play className="w-5 h-5 fill-current" />}
+                        <span>{status === TTSStatus.SUCCESS ? 'Regenerate' : 'Generate'}</span>
+                      </>
+                    )}
+                  </button>
                 </div>
               </div>
             </section>
           </main>
+          
+          <ApiKeyModal 
+            isOpen={isApiModalOpen}
+            onClose={() => setIsApiModalOpen(false)}
+            onSave={handleSaveApiKey}
+            onDisconnect={handleDisconnectApiKey}
+            hasKey={!!apiKey}
+          />
         </div>
       </div>
     </div>

@@ -7,16 +7,6 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <script>
-      // Polyfill process for browser compatibility with Node-centric libs like @google/genai
-      window.process = {
-        env: {
-          NODE_ENV: 'production'
-        },
-        version: '',
-        versions: {},
-        platform: 'browser'
-      };
-      
       tailwind.config = {
         darkMode: 'class',
         theme: {
@@ -70,6 +60,11 @@
         background-color: rgba(99, 102, 241, 0.5); 
       }
 
+      /* 
+         Force pasted content to inherit theme colors.
+         This preserves Bold/Italic structure but removes fixed colors 
+         (like black text) that would be invisible in dark mode.
+      */
       .rich-text-editor * {
         background-color: transparent !important;
         color: inherit !important; 
@@ -81,19 +76,16 @@
   <script type="importmap">
 {
   "imports": {
-    "react": "https://esm.sh/react@^19.2.4",
-    "react-dom/": "https://esm.sh/react-dom@^19.2.4/",
-    "react/": "https://esm.sh/react@^19.2.4/",
-    "@google/genai": "https://esm.sh/@google/genai@^1.41.0",
     "lucide-react": "https://esm.sh/lucide-react@^0.564.0",
-    "vite": "https://esm.sh/vite@^7.3.1",
-    "@vitejs/plugin-react": "https://esm.sh/@vitejs/plugin-react@^5.1.4"
+    "@google/genai": "https://esm.sh/@google/genai@^1.41.0",
+    "react/": "https://esm.sh/react@^19.2.4/",
+    "react": "https://esm.sh/react@^19.2.4",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.4/"
   }
 }
 </script>
 </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="/index.tsx"></script>
   </body>
 </html>

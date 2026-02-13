@@ -4,11 +4,11 @@ import { GenerationConfig } from "../types";
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export const generateSpeechFromText = async (config: GenerationConfig, apiKey?: string): Promise<string> => {
-  // Use the provided API key, or fallback to the environment variable
+  // Prioritize user-provided key, fallback to env var
   const keyToUse = apiKey || process.env.API_KEY;
   
   if (!keyToUse) {
-    throw new Error("API Key is missing. Please connect your Google Gemini API Key using the key icon in the top right.");
+    throw new Error("API Key is missing. Please click the 'Connect API' button in the top right to configure it.");
   }
 
   const ai = new GoogleGenAI({ apiKey: keyToUse });
@@ -24,16 +24,10 @@ export const generateSpeechFromText = async (config: GenerationConfig, apiKey?: 
     languageDirective = "Read the following text in English.";
   }
 
-  // Context awareness
-  let contextPrompt = "";
-  if (config.previousText) {
-    contextPrompt = `\nPREVIOUS CONTEXT (The speaker just said this. Maintain the flow, tone, and pacing from this context, but DO NOT repeat it):\n"...${config.previousText}"\n`;
-  }
-
   // Construct the final prompt
   const promptText = config.instruction 
-    ? `${languageDirective}${contextPrompt}\nStyle instruction: ${config.instruction}\n\nText to speak:\n${config.text}`
-    : `${languageDirective}${contextPrompt}\n\nText to speak:\n${config.text}`;
+    ? `${languageDirective}\nStyle instruction: ${config.instruction}\n\nText to speak:\n${config.text}`
+    : `${languageDirective}\n\nText to speak:\n${config.text}`;
 
   let lastError: any;
   const MAX_RETRIES = 3;
