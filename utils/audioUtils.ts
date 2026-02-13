@@ -1,3 +1,4 @@
+
 /**
  * Writes a string to a DataView at a specific offset.
  */
@@ -54,49 +55,4 @@ export const pcmToWav = (pcmData: ArrayBuffer, sampleRate = 24000): ArrayBuffer 
   wavArray.set(pcmArray);
 
   return buffer;
-};
-
-/**
- * Decodes a base64 string into a Uint8Array
- */
-export const base64ToUint8Array = (base64: string): Uint8Array => {
-  const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes;
-};
-
-/**
- * Merges multiple Uint8Array buffers into a single Uint8Array.
- * Useful for stitching together audio chunks.
- */
-export const mergeBuffers = (buffers: Uint8Array[]): Uint8Array => {
-  const totalLength = buffers.reduce((acc, b) => acc + b.length, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const b of buffers) {
-    result.set(b, offset);
-    offset += b.length;
-  }
-  return result;
-};
-
-/**
- * Converts Int16 PCM data (bytes) to Float32 (-1.0 to 1.0) for Web Audio API.
- * This is crucial for gapless playback in the browser.
- */
-export const convertInt16ToFloat32 = (int16Buffer: Uint8Array): Float32Array => {
-  const dataView = new DataView(int16Buffer.buffer);
-  const float32 = new Float32Array(int16Buffer.length / 2);
-  
-  for (let i = 0; i < float32.length; i++) {
-    const int16 = dataView.getInt16(i * 2, true); // Little-endian
-    // Normalize Int16 (-32768 to 32767) to Float32 (-1.0 to 1.0)
-    float32[i] = int16 < 0 ? int16 / 32768 : int16 / 32767;
-  }
-  
-  return float32;
 };

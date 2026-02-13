@@ -1,3 +1,4 @@
+
 export interface VoiceOption {
   name: string;
   gender: 'Male' | 'Female';
@@ -18,19 +19,28 @@ export interface GenerationConfig {
 
 export enum TTSStatus {
   IDLE = 'IDLE',
-  PROCESSING = 'PROCESSING', // Fetching audio
-  PLAYING = 'PLAYING',       // Audio is outputting
-  PAUSED = 'PAUSED',         // Playback paused
-  COMPLETED = 'COMPLETED',   // All chunks finished
+  PREPARING = 'PREPARING',   // Splitting text
+  PROCESSING = 'PROCESSING', // Fetching/Buffering
+  PLAYING = 'PLAYING',       // Active playback
+  PAUSED = 'PAUSED',         // User paused
+  COMPLETED = 'COMPLETED',   // All done
   ERROR = 'ERROR'
 }
 
-export interface AudioChunk {
+export interface ChunkMetadata {
   id: string;
   text: string;
-  status: 'pending' | 'generating' | 'ready' | 'error';
-  audioData?: Float32Array; // For Web Audio API playback
-  rawPcm?: Uint8Array;      // For WAV download (Int16)
-  duration?: number;        // In seconds
+  status: 'pending' | 'generating' | 'ready' | 'playing' | 'played' | 'error';
+  duration?: number;
   error?: string;
 }
+
+// Worker Types
+export type WorkerMessage = 
+  | { type: 'SPLIT_TEXT'; text: string; maxLength: number }
+  | { type: 'DECODE_AUDIO'; id: string; base64: string };
+
+export type WorkerResponse = 
+  | { type: 'SPLIT_COMPLETE'; chunks: string[] }
+  | { type: 'DECODE_COMPLETE'; id: string; audioData: Float32Array; rawPcm: Uint8Array }
+  | { type: 'ERROR'; message: string };
