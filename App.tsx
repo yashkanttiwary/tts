@@ -224,8 +224,14 @@ export default function App() {
             ? { ...c, status: 'error', error: err.message || "Failed to generate" } 
             : c
         ));
+        
         // Pause processing on error so user can see it
         setStatus(TTSStatus.PAUSED); 
+        
+        // UX Enhancement: If it's an API Key error, open the modal automatically
+        if (err.message && (err.message.includes("API Key") || err.message.includes("403"))) {
+           setIsApiKeyModalOpen(true);
+        }
       }
     };
 

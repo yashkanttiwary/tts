@@ -30,10 +30,7 @@ const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ isOpen, onClose, onSave, onDi
       setError('Please enter a valid API key');
       return;
     }
-    if (!cleanedKey.startsWith('AIza')) {
-       // Just a soft warning, not a blocker, as formats can change
-       // setError('That doesn\'t look like a standard Google API key');
-    }
+    // We strictly allow any key format here as requested
     onSave(cleanedKey);
     onClose();
   };
