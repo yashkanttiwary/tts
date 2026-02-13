@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Play, Pause, Volume2, Loader2, AlertCircle, Sun, Moon, Sparkles, Download, Layers, StopCircle, XCircle, Settings2, X, Key, RefreshCcw, FileText } from 'lucide-react';
+import { Play, Pause, Loader2, Sun, Moon, Sparkles, Download, StopCircle, XCircle, Settings2, X, Key, RefreshCcw } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus, AudioChunk } from './types';
 import { generateSpeechFromText } from './services/geminiService';
 import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
@@ -630,7 +630,7 @@ export default function App() {
                   {chunks.length > 0 ? (
                     <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-4 custom-scrollbar scroll-smooth">
                       <div className="text-base md:text-lg leading-loose text-slate-700 dark:text-slate-300 whitespace-pre-wrap font-sans">
-                        {chunks.map((chunk, index) => {
+                        {chunks.map((chunk) => {
                           const isActive = chunk.id === playingChunkId;
                           return (
                             <span 
