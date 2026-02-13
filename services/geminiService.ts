@@ -14,10 +14,18 @@ export const generateSpeechFromText = async (config: GenerationConfig, apiKey?: 
   const ai = new GoogleGenAI({ apiKey: keyToUse });
   const modelName = "gemini-2.5-flash-preview-tts";
 
-  // Construct the prompt. If there's an instruction, we prepend it as a directive.
+  // Language direction logic
+  let languageDirective = "";
+  if (config.language === 'hi') {
+    languageDirective = "Strictly speak the following text in Hindi. If the text is written in Devanagari, read it naturally. If the text is written in Latin script (Hinglish), pronounce it with a proper, native Hindi accent.";
+  } else {
+    languageDirective = "Read the following text in English.";
+  }
+
+  // Construct the final prompt
   const promptText = config.instruction 
-    ? `${config.instruction}\n\nText to speak:\n${config.text}`
-    : config.text;
+    ? `${languageDirective}\nStyle instruction: ${config.instruction}\n\nText to speak:\n${config.text}`
+    : `${languageDirective}\n\nText to speak:\n${config.text}`;
 
   let lastError: any;
   const MAX_RETRIES = 3;

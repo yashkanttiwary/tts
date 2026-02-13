@@ -5,6 +5,7 @@ import { generateSpeechFromText } from './services/geminiService';
 import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
 import VoiceSelector from './components/VoiceSelector';
 import StylePresets from './components/StylePresets';
+import LanguageSelector from './components/LanguageSelector';
 import ApiKeyModal from './components/ApiKeyModal';
 
 // Increased limit significantly as we now stream chunks
@@ -101,9 +102,10 @@ export default function App() {
   };
 
   // Content State
-  const [text, setText] = useState('Welcome to the Gemini Voice Studio. I can transform any text into lifelike speech with just a click. Paste your whole book here, I will handle it chunk by chunk, streaming the audio as soon as it is ready.');
+  const [text, setText] = useState('Welcome to the Gemini Voice Studio. I can transform any text into lifelike speech. Select Hindi from the menu to hear me speak in a native Indian accent.');
   const [instruction, setInstruction] = useState('');
   const [selectedVoice, setSelectedVoice] = useState('Puck');
+  const [selectedLanguage, setSelectedLanguage] = useState('en');
   
   // Queue & Playback State
   const [chunks, setChunks] = useState<AudioChunk[]>([]);
@@ -202,7 +204,8 @@ export default function App() {
         const base64Audio = await generateSpeechFromText({
           text: chunk.text,
           instruction,
-          voice: selectedVoice
+          voice: selectedVoice,
+          language: selectedLanguage
         }, apiKey);
 
         const rawPcm = base64ToUint8Array(base64Audio);
@@ -509,6 +512,15 @@ export default function App() {
             {/* Sidebar: Controls (Hidden on Mobile, Visible on Desktop) */}
             <aside className="hidden lg:col-span-4 lg:flex flex-col gap-4 min-h-0">
               <div className="bg-white/80 dark:bg-slate-900/60 backdrop-blur-xl border border-slate-200 dark:border-slate-700/50 rounded-2xl p-6 shadow-sm dark:shadow-xl overflow-y-auto flex-1 custom-scrollbar">
+                
+                {/* Language Selector Added Here */}
+                <LanguageSelector 
+                  selectedLanguage={selectedLanguage}
+                  onSelect={setSelectedLanguage}
+                  disabled={chunks.length > 0}
+                />
+                <div className="h-px bg-slate-200 dark:bg-slate-800 my-6" />
+
                 <VoiceSelector 
                   voices={VOICES} 
                   selectedVoice={selectedVoice} 
@@ -551,6 +563,14 @@ export default function App() {
                    </div>
                    
                    <div className="overflow-y-auto flex-1 p-6 space-y-6">
+                      <div className="space-y-4">
+                        <LanguageSelector 
+                          selectedLanguage={selectedLanguage}
+                          onSelect={setSelectedLanguage}
+                          disabled={chunks.length > 0}
+                        />
+                      </div>
+                      <div className="h-px bg-slate-200 dark:bg-slate-800" />
                       <div className="space-y-4">
                          <VoiceSelector 
                            voices={VOICES} 
