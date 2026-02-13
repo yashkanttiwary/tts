@@ -25,7 +25,8 @@ export const generateSpeechFromText = async (
   }
 
   const ai = new GoogleGenAI({ apiKey: keyToUse });
-  const modelName = "gemini-2.5-flash-preview-tts";
+  // Switched to Gemini 2.5 Pro as requested
+  const modelName = "gemini-2.5-pro";
 
   // Language direction logic
   let languageDirective = "";
@@ -113,7 +114,7 @@ export const generateSpeechFromText = async (
       console.warn(`TTS generation attempt ${attempt} failed:`, error);
 
       // Don't retry client errors
-      if (error.status === 400 || error.status === 403 || (error.message && (error.message.includes("400") || error.message.includes("403")))) {
+      if (error.status === 400 || error.status === 403 || (error.message && (error.message.includes("400") || error.message.includes("403") || error.message.includes("404")))) {
         break;
       }
       
