@@ -1,6 +1,6 @@
 import React from 'react';
 import { VoiceOption } from '../types';
-import { Check, User, Mic } from 'lucide-react';
+import { Check, User } from 'lucide-react';
 
 interface VoiceSelectorProps {
   voices: VoiceOption[];

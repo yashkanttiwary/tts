@@ -1,5 +1,5 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Play, Pause, Volume2, Loader2, AlertCircle, RefreshCcw, Sun, Moon, Sparkles, Check, Download, Layers, StopCircle, XCircle, Settings2, X, Key } from 'lucide-react';
+import { useState, useRef, useEffect } from 'react';
+import { Play, Pause, Volume2, Loader2, AlertCircle, Sun, Moon, Sparkles, Download, Layers, StopCircle, XCircle, Settings2, X, Key } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus, AudioChunk } from './types';
 import { generateSpeechFromText } from './services/geminiService';
 import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
@@ -118,7 +118,6 @@ export default function App() {
   const editorRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const nextStartTimeRef = useRef<number>(0);
   const schedulerTimerRef = useRef<number | null>(null);
   const isPlayingRef = useRef<boolean>(false);
   
@@ -170,7 +169,6 @@ export default function App() {
     setStatus(TTSStatus.IDLE);
     setPlayingChunkId(null);
     isPlayingRef.current = false;
-    nextStartTimeRef.current = 0;
   };
 
   const handleReset = () => {
@@ -243,41 +241,8 @@ export default function App() {
   }, [chunks, status]); // Re-run when chunks change (one finishes) or status changes (resume)
 
 
-  // --- Core Logic: Audio Scheduler (Gapless) ---
-  const startAudioScheduler = useCallback(() => {
-    if (schedulerTimerRef.current) return;
-    
-    const ctx = audioContextRef.current;
-    if (!ctx) return;
-
-    if (ctx.state === 'suspended') ctx.resume();
-
-    // Reset start time to now if we are starting fresh
-    if (nextStartTimeRef.current < ctx.currentTime) {
-      nextStartTimeRef.current = ctx.currentTime + 0.1; // Small buffer
-    }
-
-    isPlayingRef.current = true;
-
-    // Check every 100ms if we need to schedule the next chunk
-    schedulerTimerRef.current = window.setInterval(() => {
-      if (!isPlayingRef.current) return;
-
-      const currentTime = ctx.currentTime;
-      // Schedule ahead by 0.5 seconds
-      if (nextStartTimeRef.current - currentTime > 0.5) return;
-
-      // Find the next ready chunk that hasn't been played
-      // We rely on playingChunkId to know where we are conceptually in UI.
-      
-      setChunks(currentChunks => {
-        return currentChunks;
-      });
-
-    }, 100);
-  }, []);
-
-  // Alternative simpler Player: Watch the queue and schedule *one by one* using onended logic mock
+  // --- Core Logic: Audio Player ---
+  // Simple queue watcher that schedules chunks one by one using onended
   useEffect(() => {
     if (status !== TTSStatus.PLAYING && status !== TTSStatus.PROCESSING) {
        // Paused or Idle, pause context?
@@ -421,7 +386,8 @@ export default function App() {
     
     const buffers = readyChunks.map(c => c.rawPcm!);
     const merged = mergeBuffers(buffers);
-    const wav = pcmToWav(merged.buffer);
+    // Cast buffer to ArrayBuffer to fix TS error
+    const wav = pcmToWav(merged.buffer as ArrayBuffer);
     const blob = new Blob([wav], { type: 'audio/wav' });
     const url = URL.createObjectURL(blob);
     
