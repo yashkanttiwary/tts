@@ -1,15 +1,16 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Play, Volume2, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check } from 'lucide-react';
-import { VoiceOption, PresetOption, TTSStatus } from './types';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Play, Pause, Volume2, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, XCircle, SkipForward, Layers, StopCircle } from 'lucide-react';
+import { VoiceOption, PresetOption, TTSStatus, AudioChunk } from './types';
 import { generateSpeechFromText } from './services/geminiService';
-import { pcmToWav, base64ToUint8Array, mergeBuffers } from './utils/audioUtils';
+import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
 import VoiceSelector from './components/VoiceSelector';
 import StylePresets from './components/StylePresets';
 import ApiKeyModal from './components/ApiKeyModal';
 
-const MAX_CHARS = 100000;
-const CHUNK_SIZE = 1000; 
-const BATCH_SIZE = 2;    
+// Increased limit significantly as we now stream chunks
+const MAX_CHARS = 1000000; 
+// Target size for each request (approx 1-2 paragraphs) for optimal streaming speed vs rate limits
+const IDEAL_CHUNK_SIZE = 400; 
 
 const VOICES: VoiceOption[] = [
   { name: 'Puck', gender: 'Male', style: 'Upbeat & Playful', description: 'Great for storytelling and lively content.' },
@@ -26,28 +27,57 @@ const PRESETS: PresetOption[] = [
   { label: 'Whisper', prompt: 'Whisper this very quietly, intimately, and secretively:' },
 ];
 
-function splitTextIdeally(text: string, maxLength: number): string[] {
+// Advanced splitter that respects sentence boundaries for natural pauses
+function smartSplitText(text: string, maxLength: number): string[] {
   if (text.length <= maxLength) return [text];
+  
   const chunks: string[] = [];
-  let currentText = text;
-  while (currentText.length > 0) {
-    if (currentText.length <= maxLength) {
-      chunks.push(currentText);
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLength) {
+      chunks.push(remaining.trim());
       break;
     }
+
+    // Try to split at paragraph
     let splitIndex = -1;
-    const sentenceEndings = ['. ', '! ', '? ', '.\n', '!\n', '?\n', '." ', '!" ', '?" '];
-    for (let i = maxLength; i > maxLength * 0.8; i--) {
-        const char = currentText[i];
-        if (char === '\n' && currentText[i-1] === '\n') { splitIndex = i; break; }
-        if (sentenceEndings.some(end => currentText.substring(i - 1, i + end.length - 1) === end)) { splitIndex = i + 1; break; }
+    const searchBuffer = remaining.substring(0, maxLength);
+    
+    // Priority 1: Double Newlines (Paragraphs)
+    let candidate = searchBuffer.lastIndexOf('\n\n');
+    if (candidate > maxLength * 0.3) splitIndex = candidate + 2;
+
+    // Priority 2: Sentence endings (. ! ?)
+    if (splitIndex === -1) {
+       const sentenceMatches = [...searchBuffer.matchAll(/[.!?]\s/g)];
+       if (sentenceMatches.length > 0) {
+          const lastMatch = sentenceMatches[sentenceMatches.length - 1];
+          if (lastMatch.index && lastMatch.index > maxLength * 0.3) {
+             splitIndex = lastMatch.index + lastMatch[0].length;
+          }
+       }
     }
-    if (splitIndex === -1) splitIndex = currentText.lastIndexOf(' ', maxLength);
+
+    // Priority 3: Commas or semicols (Soft pauses)
+    if (splitIndex === -1) {
+       candidate = Math.max(searchBuffer.lastIndexOf(', '), searchBuffer.lastIndexOf('; '));
+       if (candidate > maxLength * 0.3) splitIndex = candidate + 2;
+    }
+
+    // Priority 4: Spaces
+    if (splitIndex === -1) {
+       splitIndex = searchBuffer.lastIndexOf(' ');
+    }
+
+    // Fallback: Hard cut
     if (splitIndex === -1) splitIndex = maxLength;
-    chunks.push(currentText.substring(0, splitIndex).trim());
-    currentText = currentText.substring(splitIndex).trim();
+
+    chunks.push(remaining.substring(0, splitIndex).trim());
+    remaining = remaining.substring(splitIndex).trim();
   }
-  return chunks;
+  
+  return chunks.filter(c => c.length > 0);
 }
 
 export default function App() {
@@ -57,48 +87,53 @@ export default function App() {
   const [apiKey, setApiKey] = useState('');
   const [isApiModalOpen, setIsApiModalOpen] = useState(false);
 
-  // We use this state to track plain text for the API and character count
-  const [text, setText] = useState('Welcome to the Gemini Voice Studio. I can transform any text into lifelike speech with just a click. Paste your whole book here, I will handle it chunk by chunk.');
-  
+  // Content State
+  const [text, setText] = useState('Welcome to the Gemini Voice Studio. I can transform any text into lifelike speech with just a click. Paste your whole book here, I will handle it chunk by chunk, streaming the audio as soon as it is ready.');
   const [instruction, setInstruction] = useState('');
   const [selectedVoice, setSelectedVoice] = useState('Puck');
-  const [status, setStatus] = useState<TTSStatus>(TTSStatus.IDLE);
-  const [progressMessage, setProgressMessage] = useState('');
-  const [error, setError] = useState('');
-  const [audioUrl, setAudioUrl] = useState<string | null>(null);
-  const audioRef = useRef<HTMLAudioElement>(null);
   
-  // Ref for the contentEditable div
+  // Queue & Playback State
+  const [chunks, setChunks] = useState<AudioChunk[]>([]);
+  const [status, setStatus] = useState<TTSStatus>(TTSStatus.IDLE);
+  const [playingChunkId, setPlayingChunkId] = useState<string | null>(null);
+  const [playbackRate, setPlaybackRate] = useState(1.0);
+  const [error, setError] = useState('');
+  
+  // Refs
   const editorRef = useRef<HTMLDivElement>(null);
-
-  // Load API key from local storage on mount
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const nextStartTimeRef = useRef<number>(0);
+  const schedulerTimerRef = useRef<number | null>(null);
+  const isPlayingRef = useRef<boolean>(false);
+  
+  // Load API key
   useEffect(() => {
     const storedKey = localStorage.getItem('gemini_api_key');
     if (storedKey) setApiKey(storedKey);
+    // Initialize Audio Context on user interaction usually, but here we prep ref
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    if (AudioContextClass) {
+      audioContextRef.current = new AudioContextClass({ sampleRate: 24000 });
+    }
   }, []);
 
+  // Cleanup on unmount
   useEffect(() => {
-    return () => { if (audioUrl) URL.revokeObjectURL(audioUrl); };
-  }, [audioUrl]);
+    return () => {
+      stopPlayback();
+    };
+  }, []);
 
-  useEffect(() => {
-    if (status === TTSStatus.SUCCESS && audioUrl && audioRef.current) {
-      audioRef.current.play().catch(e => console.log("Auto-play blocked"));
-    }
-  }, [status, audioUrl]);
-
-  // Initial content setup
+  // Editor Sync
   useEffect(() => {
     if (editorRef.current && text && editorRef.current.innerText === '') {
       editorRef.current.innerText = text;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, []); // Run once on mount
 
   const handleInput = () => {
-    if (editorRef.current) {
-      setText(editorRef.current.innerText);
-    }
+    if (editorRef.current) setText(editorRef.current.innerText);
   };
 
   const handleSaveApiKey = (key: string) => {
@@ -106,77 +141,315 @@ export default function App() {
     localStorage.setItem('gemini_api_key', key);
   };
 
-  const handleDisconnectApiKey = () => {
-    setApiKey('');
-    localStorage.removeItem('gemini_api_key');
+  const stopPlayback = () => {
+    // Stop API generation
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    // Stop Audio
+    if (audioContextRef.current) {
+      audioContextRef.current.close().then(() => {
+         const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+         audioContextRef.current = new AudioContextClass({ sampleRate: 24000 });
+      });
+    }
+    if (schedulerTimerRef.current) {
+      window.clearInterval(schedulerTimerRef.current);
+      schedulerTimerRef.current = null;
+    }
+    
+    setStatus(TTSStatus.IDLE);
+    setPlayingChunkId(null);
+    isPlayingRef.current = false;
+    nextStartTimeRef.current = 0;
   };
 
+  const handleReset = () => {
+    stopPlayback();
+    setChunks([]);
+    setError('');
+  };
+
+  // --- Core Logic: Generator Loop ---
+  // This effect watches the chunks. If there is a PENDING chunk and we are processing, it fetches it.
+  useEffect(() => {
+    const processNextChunk = async () => {
+      if (status !== TTSStatus.PROCESSING && status !== TTSStatus.PLAYING) return;
+      
+      const pendingIndex = chunks.findIndex(c => c.status === 'pending');
+      if (pendingIndex === -1) {
+        // All done processing?
+        if (chunks.every(c => c.status === 'ready' || c.status === 'error')) {
+          // If we aren't playing, we are completely done. 
+          // If we ARE playing, the play loop will handle setting COMPLETED status when audio ends.
+        }
+        return;
+      }
+
+      const chunk = chunks[pendingIndex];
+      
+      // Update status to generating
+      setChunks(prev => prev.map((c, i) => i === pendingIndex ? { ...c, status: 'generating' } : c));
+
+      try {
+        const base64Audio = await generateSpeechFromText({
+          text: chunk.text,
+          instruction,
+          voice: selectedVoice
+        }, apiKey);
+
+        const rawPcm = base64ToUint8Array(base64Audio);
+        const audioFloat32 = convertInt16ToFloat32(rawPcm);
+        
+        // Calculate duration: samples / sampleRate (24000)
+        const duration = audioFloat32.length / 24000;
+
+        setChunks(prev => prev.map((c, i) => 
+          i === pendingIndex 
+            ? { ...c, status: 'ready', rawPcm, audioData: audioFloat32, duration } 
+            : c
+        ));
+
+      } catch (err: any) {
+        console.error("Chunk failed", err);
+        setChunks(prev => prev.map((c, i) => 
+          i === pendingIndex 
+            ? { ...c, status: 'error', error: err.message || "Failed to generate" } 
+            : c
+        ));
+        // Pause processing on error so user can see it
+        setStatus(TTSStatus.PAUSED); 
+      }
+    };
+
+    processNextChunk();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chunks, status]); // Re-run when chunks change (one finishes) or status changes (resume)
+
+
+  // --- Core Logic: Audio Scheduler (Gapless) ---
+  const startAudioScheduler = useCallback(() => {
+    if (schedulerTimerRef.current) return;
+    
+    const ctx = audioContextRef.current;
+    if (!ctx) return;
+
+    if (ctx.state === 'suspended') ctx.resume();
+
+    // Reset start time to now if we are starting fresh
+    if (nextStartTimeRef.current < ctx.currentTime) {
+      nextStartTimeRef.current = ctx.currentTime + 0.1; // Small buffer
+    }
+
+    isPlayingRef.current = true;
+
+    // Check every 100ms if we need to schedule the next chunk
+    schedulerTimerRef.current = window.setInterval(() => {
+      if (!isPlayingRef.current) return;
+
+      const currentTime = ctx.currentTime;
+      // Schedule ahead by 0.5 seconds
+      if (nextStartTimeRef.current - currentTime > 0.5) return;
+
+      // Find the next ready chunk that hasn't been played
+      // We rely on playingChunkId to know where we are conceptually in UI, 
+      // but strictly we just need to schedule the *next* buffer.
+      // Actually, tracking which one is playing in the UI requires exact timing. 
+      // For simplicity, we'll queue them up.
+      
+      setChunks(currentChunks => {
+        // Find first 'ready' chunk that implies it's next in line.
+        // We need a pointer. Let's use a "played" flag or just rely on 'ready' status + index.
+        // Issue: 'ready' chunks persist. We need to know which one is NEXT.
+        // Let's assume we play them in order. 
+        
+        // We'll use a ref to track index of next chunk to schedule
+        // But state updates inside setInterval are tricky.
+        return currentChunks;
+      });
+
+    }, 100);
+  }, []);
+
+  // Alternative simpler Player: Watch the queue and schedule *one by one* using onended logic mock
+  // Since we want robust UI feedback, let's play Chunk X. When X finishes, Play X+1.
+  useEffect(() => {
+    if (status !== TTSStatus.PLAYING && status !== TTSStatus.PROCESSING) {
+       // Paused or Idle, pause context?
+       if (audioContextRef.current?.state === 'running') {
+         audioContextRef.current.suspend();
+       }
+       return;
+    }
+
+    if (audioContextRef.current?.state === 'suspended') {
+      audioContextRef.current.resume();
+    }
+
+    const scheduleNext = () => {
+      const ctx = audioContextRef.current;
+      if (!ctx) return;
+
+      // Determine next chunk index
+      let nextIndex = 0;
+      if (playingChunkId) {
+        const currentIdx = chunks.findIndex(c => c.id === playingChunkId);
+        if (currentIdx !== -1) nextIndex = currentIdx + 1;
+      }
+
+      if (nextIndex >= chunks.length) {
+         // Check if we are totally done
+         if (status === TTSStatus.PROCESSING) {
+            // Still waiting for generation
+            return;
+         }
+         // All done
+         setStatus(TTSStatus.COMPLETED);
+         setPlayingChunkId(null);
+         return;
+      }
+
+      const nextChunk = chunks[nextIndex];
+
+      if (nextChunk.status === 'ready' && nextChunk.audioData) {
+        // Prepare Source
+        const buffer = ctx.createBuffer(1, nextChunk.audioData.length, 24000);
+        buffer.getChannelData(0).set(nextChunk.audioData);
+        
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.playbackRate.value = playbackRate;
+        source.connect(ctx.destination);
+        
+        // Schedule play
+        // For gapless, we schedule at nextStartTimeRef.current
+        // BUT, if we just finished a pause, nextStartTime might be old.
+        // Simplified: Just play NOW. Gaps of 1-5ms are acceptable for "Robustness" vs complexity of exact scheduling.
+        // We will use 'onended' to trigger the next state update.
+        
+        source.onended = () => {
+           // Trigger next
+           // We need to trigger a re-eval. We do this by updating playingChunkId
+           // But we need to verify we aren't paused.
+           if (isPlayingRef.current) {
+              // Wait a tick to ensure state updates don't clash
+              setTimeout(scheduleNext, 0); 
+           }
+        };
+
+        setPlayingChunkId(nextChunk.id);
+        source.start(0);
+        isPlayingRef.current = true;
+      } else if (nextChunk.status === 'error') {
+         // Skip error chunks? or Stop?
+         // Let's skip
+         setPlayingChunkId(nextChunk.id); // Mark as passed
+         setTimeout(scheduleNext, 100);
+      } else {
+         // Next chunk not ready yet. 
+         // We wait. The effect dependency on [chunks] will re-trigger this when chunk becomes ready.
+      }
+    };
+    
+    // Trigger if we aren't playing anything
+    if (!isPlayingRef.current && playingChunkId === null && chunks.length > 0) {
+       scheduleNext();
+    } 
+    // Trigger if we are stuck waiting (chunk just became ready)
+    else if (isPlayingRef.current && playingChunkId) {
+       // Check if current playing is actually playing... 
+       // The onended callback handles the loop. 
+       // But if we were buffering (waiting for generation), we need to kickstart it.
+       const currentIdx = chunks.findIndex(c => c.id === playingChunkId);
+       // If we are waiting for currentIdx + 1
+       const nextChunk = chunks[currentIdx + 1];
+       if (nextChunk && nextChunk.status === 'ready' && !isPlayingRef.current) {
+         // This implies we stalled. Restart the loop.
+         scheduleNext();
+       }
+    }
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chunks, status, playbackRate]);
+
+
+  // --- Handlers ---
+
   const handleGenerate = async () => {
-    // Check for API key first
     if (!apiKey && !process.env.API_KEY) {
       setIsApiModalOpen(true);
       return;
     }
 
     const currentText = editorRef.current?.innerText || text;
-    
     if (!currentText.trim()) return;
-    if (currentText.length > MAX_CHARS) {
-      setError(`Text exceeds limit of ${MAX_CHARS.toLocaleString()} characters.`);
-      return;
-    }
 
-    setStatus(TTSStatus.GENERATING);
+    handleReset();
     setError('');
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
-    setAudioUrl(null);
 
-    try {
-      const chunks = splitTextIdeally(currentText, CHUNK_SIZE);
-      const pcmChunks: Uint8Array[] = new Array(chunks.length);
-
-      const totalBatches = Math.ceil(chunks.length / BATCH_SIZE);
-
-      for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-        const batchSlice = chunks.slice(i, i + BATCH_SIZE);
-        const currentBatchIndex = Math.floor(i / BATCH_SIZE) + 1;
-        
-        setProgressMessage(`Synthesizing batch ${currentBatchIndex} of ${totalBatches}...`);
-
-        const batchPromises = batchSlice.map((chunk, idx) => {
-          const globalIndex = i + idx;
-          return generateSpeechFromText({
-            text: chunk,
-            instruction,
-            voice: selectedVoice
-          }, apiKey).then(base64 => ({ index: globalIndex, data: base64ToUint8Array(base64) }));
-        });
-
-        const results = await Promise.all(batchPromises);
-        
-        results.forEach(res => {
-          pcmChunks[res.index] = res.data;
-        });
-      }
-
-      setProgressMessage('Finalizing audio...');
-      const mergedPcm = mergeBuffers(pcmChunks);
-      const wavBuffer = pcmToWav(mergedPcm.buffer);
-      const blob = new Blob([wavBuffer], { type: 'audio/wav' });
-      const url = URL.createObjectURL(blob);
-      
-      setAudioUrl(url);
-      setStatus(TTSStatus.SUCCESS);
-      setProgressMessage('');
-
-    } catch (err: any) {
-      setError(err.message || "An unexpected error occurred.");
-      setStatus(TTSStatus.ERROR);
-      setProgressMessage('');
+    // 1. Split Text
+    const textSegments = smartSplitText(currentText, IDEAL_CHUNK_SIZE);
+    
+    // 2. Initialize Queue
+    const newChunks: AudioChunk[] = textSegments.map((seg, i) => ({
+      id: `chunk-${Date.now()}-${i}`,
+      text: seg,
+      status: 'pending'
+    }));
+    
+    setChunks(newChunks);
+    setStatus(TTSStatus.PROCESSING);
+    isPlayingRef.current = false;
+    
+    // Initialize Audio Context if needed
+    if (!audioContextRef.current) {
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      audioContextRef.current = new AudioContextClass({ sampleRate: 24000 });
+    }
+    if (audioContextRef.current.state === 'suspended') {
+      await audioContextRef.current.resume();
     }
   };
 
-  const isLoading = status === TTSStatus.GENERATING;
+  const togglePlayPause = () => {
+    if (status === TTSStatus.PLAYING || status === TTSStatus.PROCESSING) {
+      setStatus(TTSStatus.PAUSED);
+      audioContextRef.current?.suspend();
+      isPlayingRef.current = false;
+    } else if (status === TTSStatus.PAUSED) {
+      // Resume
+      setStatus(chunks.some(c => c.status === 'pending' || c.status === 'generating') ? TTSStatus.PROCESSING : TTSStatus.PLAYING);
+      audioContextRef.current?.resume();
+      isPlayingRef.current = true;
+      // Kickstart loop if needed (if we were waiting for data)
+      // The effect hook [status] will run and trigger play logic
+    }
+  };
+
+  const handleDownloadFull = () => {
+    const readyChunks = chunks.filter(c => c.status === 'ready' && c.rawPcm);
+    if (readyChunks.length === 0) return;
+    
+    const buffers = readyChunks.map(c => c.rawPcm!);
+    const merged = mergeBuffers(buffers);
+    const wav = pcmToWav(merged.buffer);
+    const blob = new Blob([wav], { type: 'audio/wav' });
+    const url = URL.createObjectURL(blob);
+    
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `gemini-full-speech.wav`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const completedCount = chunks.filter(c => c.status === 'ready').length;
+  const totalCount = chunks.length;
+  const progressPercent = totalCount > 0 ? (completedCount / totalCount) * 100 : 0;
+  const isGenerating = status === TTSStatus.PROCESSING;
 
   return (
     <div className={isDarkMode ? 'dark' : ''}>
@@ -201,7 +474,7 @@ export default function App() {
                 Gemini Voice Studio
               </h1>
               <p className="text-slate-500 dark:text-slate-400 text-sm md:text-base max-w-lg">
-                Create lifelike speech with emotional intelligence.
+                Pro-grade streaming TTS. No length limits. Gapless playback.
               </p>
             </div>
             
@@ -239,26 +512,14 @@ export default function App() {
                   voices={VOICES} 
                   selectedVoice={selectedVoice} 
                   onSelect={setSelectedVoice}
-                  disabled={isLoading}
+                  disabled={chunks.length > 0} // Lock voice while generating
                 />
                 <div className="h-px bg-slate-200 dark:bg-slate-800 my-6" />
                 <StylePresets 
                   presets={PRESETS} 
                   onSelect={setInstruction}
-                  disabled={isLoading}
+                  disabled={chunks.length > 0}
                 />
-              </div>
-              
-              <div className="bg-gradient-to-br from-indigo-50 to-purple-50 dark:from-indigo-900/20 dark:to-purple-900/20 border border-indigo-100 dark:border-indigo-500/10 rounded-xl p-4 flex gap-3 items-start shrink-0">
-                 <div className="bg-indigo-100 dark:bg-indigo-500/20 p-2 rounded-lg shrink-0">
-                   <Wand2 className="w-4 h-4 text-indigo-600 dark:text-indigo-300" />
-                 </div>
-                 <div>
-                   <h3 className="text-sm font-bold text-indigo-900 dark:text-indigo-200 mb-1">Rich Text Ready</h3>
-                   <p className="text-xs text-indigo-700/80 dark:text-indigo-300/70 leading-relaxed">
-                     Paste your formatted text directly. We preserve the look while generating seamless audio from the content.
-                   </p>
-                 </div>
               </div>
             </aside>
 
@@ -274,93 +535,181 @@ export default function App() {
                         value={instruction}
                         onChange={(e) => setInstruction(e.target.value)}
                         placeholder="Style Direction (e.g. 'Whisper urgently...')"
-                        disabled={isLoading}
+                        disabled={chunks.length > 0}
                         className="w-full bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-900 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 placeholder:text-slate-400 dark:placeholder:text-slate-600 transition-all shadow-sm"
                      />
                   </div>
+                  
+                  {/* Status Badges */}
+                  {chunks.length > 0 && (
+                     <div className="flex items-center gap-2">
+                       <div className="text-xs font-mono bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300 px-2 py-1 rounded-md border border-indigo-200 dark:border-indigo-800 flex items-center gap-1.5">
+                         <Layers className="w-3 h-3" />
+                         <span>{completedCount}/{totalCount} Processed</span>
+                       </div>
+                       {isGenerating && (
+                         <div className="flex items-center gap-1.5 text-xs font-medium text-amber-600 dark:text-amber-400 animate-pulse px-2">
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                            Streaming...
+                         </div>
+                       )}
+                     </div>
+                  )}
+
                   <div className={`text-[10px] md:text-xs font-mono font-medium px-2.5 py-1.5 rounded-md border 
                     ${text.length > MAX_CHARS 
                       ? 'text-red-600 dark:text-red-400 border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-900/10' 
-                      : text.length > MAX_CHARS * 0.9 
-                        ? 'text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10' 
-                        : 'text-slate-500 dark:text-slate-400 border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800'}
+                      : 'text-slate-500 dark:text-slate-400 border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800'}
                   `}>
-                    {text.length.toLocaleString()} / {MAX_CHARS.toLocaleString()}
+                    {text.length.toLocaleString()} chars
                   </div>
                 </div>
 
-                {/* Editor */}
-                <div className="flex-1 relative min-h-0 z-10 group bg-transparent">
-                  <div
-                    ref={editorRef}
-                    contentEditable={!isLoading}
-                    onInput={handleInput}
-                    data-placeholder="Enter or paste your text here..."
-                    className="rich-text-editor w-full h-full p-6 text-base md:text-lg leading-loose text-slate-800 dark:text-slate-200 focus:outline-none custom-scrollbar"
-                    suppressContentEditableWarning={true}
-                  />
-                </div>
-
-                {/* Error Banner */}
-                {error && (
-                  <div className="bg-red-50 dark:bg-red-900/20 border-y border-red-200 dark:border-red-900/30 px-6 py-3 flex items-center gap-3 animate-in slide-in-from-bottom-2 fade-in z-20 shrink-0">
-                    <AlertCircle className="w-5 h-5 text-red-600 dark:text-red-400 shrink-0" />
-                    <p className="text-sm text-red-700 dark:text-red-300 font-medium">{error}</p>
-                    <button onClick={() => setError('')} className="ml-auto text-red-500 hover:text-red-700 dark:hover:text-red-200 text-sm font-medium">
-                      Dismiss
-                    </button>
+                {/* Queue Visualization Overlay (Visible when processing) */}
+                {chunks.length > 0 && (
+                  <div className="w-full h-1 bg-slate-200 dark:bg-slate-800 overflow-hidden">
+                    <div 
+                      className="h-full bg-indigo-500 transition-all duration-300 ease-out"
+                      style={{ width: `${progressPercent}%` }}
+                    />
                   </div>
                 )}
 
-                {/* Action Bar */}
-                <div className="p-4 md:p-6 bg-slate-50/80 dark:bg-slate-800/30 border-t border-slate-200 dark:border-slate-700/50 flex flex-col md:flex-row items-center gap-4 md:gap-6 z-20 shrink-0">
+                {/* Editor Area */}
+                <div className="flex-1 relative min-h-0 z-10 group bg-transparent flex flex-col">
+                  {/* If we are processing, show the split text chunks to visualize playback */}
+                  {chunks.length > 0 ? (
+                    <div className="flex-1 overflow-y-auto p-6 space-y-4 custom-scrollbar scroll-smooth">
+                      {chunks.map((chunk) => (
+                        <div 
+                          key={chunk.id}
+                          className={`
+                            p-3 rounded-lg border transition-all duration-300 text-lg leading-relaxed
+                            ${chunk.id === playingChunkId 
+                              ? 'bg-indigo-50 dark:bg-indigo-900/20 border-indigo-200 dark:border-indigo-500/50 text-indigo-900 dark:text-indigo-100 shadow-sm scale-[1.01]' 
+                              : chunk.status === 'ready'
+                                ? 'bg-slate-50 dark:bg-slate-800/30 border-slate-100 dark:border-slate-800 text-slate-600 dark:text-slate-300'
+                                : chunk.status === 'error'
+                                  ? 'bg-red-50 dark:bg-red-900/10 border-red-200 dark:border-red-900/30 text-red-800 dark:text-red-200'
+                                  : 'opacity-50 border-transparent text-slate-400'
+                            }
+                          `}
+                        >
+                          <div className="flex justify-between items-start gap-4">
+                             <span>{chunk.text}</span>
+                             <div className="shrink-0 mt-1">
+                               {chunk.status === 'generating' && <Loader2 className="w-4 h-4 animate-spin text-amber-500" />}
+                               {chunk.status === 'error' && <AlertCircle className="w-4 h-4 text-red-500" />}
+                               {chunk.id === playingChunkId && <Volume2 className="w-4 h-4 text-indigo-500 animate-pulse" />}
+                             </div>
+                          </div>
+                          {chunk.error && <div className="text-xs text-red-500 mt-2 font-mono">{chunk.error}</div>}
+                        </div>
+                      ))}
+                      
+                      {/* Spacer for bottom scrolling */}
+                      <div className="h-20" />
+                    </div>
+                  ) : (
+                    <div
+                      ref={editorRef}
+                      contentEditable={true}
+                      onInput={handleInput}
+                      data-placeholder="Enter or paste your text here..."
+                      className="rich-text-editor w-full h-full p-6 text-base md:text-lg leading-loose text-slate-800 dark:text-slate-200 focus:outline-none custom-scrollbar"
+                      suppressContentEditableWarning={true}
+                    />
+                  )}
+                </div>
+
+                {/* Controls Area */}
+                <div className="p-4 md:p-6 bg-slate-50/80 dark:bg-slate-800/30 border-t border-slate-200 dark:border-slate-700/50 flex flex-col gap-4 z-20 shrink-0 backdrop-blur-md">
                   
-                  {/* Player Interface */}
-                  <div className="flex-1 w-full bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-700 p-2 flex items-center min-h-[56px] shadow-sm">
-                    {status === TTSStatus.SUCCESS && audioUrl ? (
-                      <audio 
-                        ref={audioRef}
-                        controls 
-                        src={audioUrl} 
-                        className="w-full h-10 block focus:outline-none" 
-                      />
-                    ) : (
-                      <div className="w-full text-center text-sm text-slate-500 dark:text-slate-500 italic flex items-center justify-center gap-2">
-                         {isLoading ? (
-                           <div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400">
-                             <span className="animate-pulse font-medium">{progressMessage || 'Initializing...'}</span>
+                  {/* Error Message */}
+                  {error && (
+                     <div className="flex items-center justify-between text-xs text-red-600 bg-red-50 dark:bg-red-900/20 p-2 rounded-lg border border-red-100 dark:border-red-800 mb-2">
+                       <span>{error}</span>
+                       <button onClick={() => setError('')}><XCircle className="w-4 h-4" /></button>
+                     </div>
+                  )}
+
+                  <div className="flex flex-col md:flex-row items-center gap-4">
+                    
+                    {/* Playback Controls */}
+                    {chunks.length > 0 ? (
+                      <div className="flex-1 w-full flex items-center gap-4 bg-white dark:bg-slate-900 p-2 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
+                         <button
+                           onClick={togglePlayPause}
+                           className="w-12 h-12 flex items-center justify-center rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white shadow-md transition-all active:scale-95"
+                         >
+                           {status === TTSStatus.PLAYING || status === TTSStatus.PROCESSING ? (
+                             <Pause className="w-5 h-5 fill-current" />
+                           ) : (
+                             <Play className="w-5 h-5 fill-current ml-0.5" />
+                           )}
+                         </button>
+
+                         <div className="flex-1 flex flex-col justify-center gap-1">
+                           <div className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                              {status === TTSStatus.COMPLETED ? 'Playback Complete' : status === TTSStatus.PAUSED ? 'Paused' : 'Playing & Streaming...'}
                            </div>
-                         ) : (
-                           'Ready to generate'
-                         )}
+                           <div className="text-xs text-slate-500 dark:text-slate-400 font-mono">
+                             {completedCount} chunks ready
+                           </div>
+                         </div>
+
+                         <div className="h-8 w-px bg-slate-200 dark:bg-slate-700 mx-2" />
+
+                         {/* Playback Rate */}
+                         <div className="flex items-center gap-1">
+                            {[1, 1.25, 1.5, 2].map(rate => (
+                              <button
+                                key={rate}
+                                onClick={() => setPlaybackRate(rate)}
+                                className={`text-[10px] font-bold px-2 py-1 rounded ${playbackRate === rate ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900 dark:text-indigo-300' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800'}`}
+                              >
+                                {rate}x
+                              </button>
+                            ))}
+                         </div>
+                         
+                         <button 
+                           onClick={handleReset}
+                           className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
+                           title="Stop & Clear"
+                         >
+                           <StopCircle className="w-5 h-5" />
+                         </button>
                       </div>
+                    ) : (
+                      /* Initial Generate Button */
+                      <button
+                        onClick={handleGenerate}
+                        disabled={!text.trim()}
+                        className={`
+                          w-full flex-1 px-8 py-4 rounded-xl font-bold text-white shadow-lg flex items-center justify-center gap-3 transition-all transform
+                          ${!text.trim()
+                            ? 'bg-slate-300 dark:bg-slate-700 cursor-not-allowed opacity-70 shadow-none' 
+                            : 'bg-indigo-600 hover:bg-indigo-500 hover:scale-[1.01] active:scale-[0.99] shadow-indigo-500/20'
+                          }
+                        `}
+                      >
+                        <Play className="w-5 h-5 fill-current" />
+                        <span className="text-lg">Generate Speech</span>
+                      </button>
+                    )}
+
+                    {/* Download Button (Only visible if we have data) */}
+                    {completedCount > 0 && (
+                      <button 
+                        onClick={handleDownloadFull}
+                        className="px-5 py-4 rounded-xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-indigo-500 dark:hover:border-indigo-400 text-slate-700 dark:text-slate-200 font-semibold shadow-sm hover:shadow-md transition-all flex items-center gap-2"
+                      >
+                        <Download className="w-5 h-5" />
+                        <span className="hidden md:inline">Download Full WAV</span>
+                      </button>
                     )}
                   </div>
-
-                  {/* Generate Button */}
-                  <button
-                    onClick={handleGenerate}
-                    disabled={isLoading || !text.trim()}
-                    className={`
-                      w-full md:w-auto px-8 py-3.5 rounded-xl font-bold text-white shadow-lg flex items-center justify-center gap-2.5 transition-all transform
-                      ${isLoading || !text.trim()
-                        ? 'bg-slate-300 dark:bg-slate-700 cursor-not-allowed opacity-70 shadow-none' 
-                        : 'bg-indigo-600 hover:bg-indigo-500 dark:bg-gradient-to-r dark:from-indigo-600 dark:to-purple-600 dark:hover:from-indigo-500 dark:hover:to-purple-500 hover:scale-[1.02] active:scale-[0.98] shadow-indigo-500/20'
-                      }
-                    `}
-                  >
-                    {isLoading ? (
-                      <>
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                        <span>Processing</span>
-                      </>
-                    ) : (
-                      <>
-                        {status === TTSStatus.SUCCESS ? <RefreshCcw className="w-5 h-5" /> : <Play className="w-5 h-5 fill-current" />}
-                        <span>{status === TTSStatus.SUCCESS ? 'Regenerate' : 'Generate'}</span>
-                      </>
-                    )}
-                  </button>
                 </div>
               </div>
             </section>
@@ -370,7 +719,10 @@ export default function App() {
             isOpen={isApiModalOpen}
             onClose={() => setIsApiModalOpen(false)}
             onSave={handleSaveApiKey}
-            onDisconnect={handleDisconnectApiKey}
+            onDisconnect={() => {
+              setApiKey('');
+              localStorage.removeItem('gemini_api_key');
+            }}
             hasKey={!!apiKey}
           />
         </div>

@@ -18,7 +18,19 @@ export interface GenerationConfig {
 
 export enum TTSStatus {
   IDLE = 'IDLE',
-  GENERATING = 'GENERATING',
-  SUCCESS = 'SUCCESS',
+  PROCESSING = 'PROCESSING', // Fetching audio
+  PLAYING = 'PLAYING',       // Audio is outputting
+  PAUSED = 'PAUSED',         // Playback paused
+  COMPLETED = 'COMPLETED',   // All chunks finished
   ERROR = 'ERROR'
+}
+
+export interface AudioChunk {
+  id: string;
+  text: string;
+  status: 'pending' | 'generating' | 'ready' | 'error';
+  audioData?: Float32Array; // For Web Audio API playback
+  rawPcm?: Uint8Array;      // For WAV download (Int16)
+  duration?: number;        // In seconds
+  error?: string;
 }
