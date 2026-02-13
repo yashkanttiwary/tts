@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gemini Voice Studio</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+      tailwind.config = {
+        darkMode: 'class',
+        theme: {
+          extend: {
+            fontFamily: {
+              sans: ['Inter', 'sans-serif'],
+            }
+          }
+        }
+      }
+    </script>
+    <style>
+      body {
+        font-family: 'Inter', sans-serif;
+      }
+      
+      /* Rich Text Editor Styles */
+      .rich-text-editor {
+        outline: none;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        overflow-y: auto;
+      }
+      
+      /* Placeholder handling for contentEditable */
+      .rich-text-editor:empty:before {
+        content: attr(data-placeholder);
+        color: #94a3b8; /* slate-400 */
+        pointer-events: none;
+        display: block; /* Ensures it appears */
+      }
+      .dark .rich-text-editor:empty:before {
+        color: #475569; /* slate-600 */
+      }
+
+      /* Scrollbar styling */
+      .rich-text-editor::-webkit-scrollbar {
+        width: 8px;
+      }
+      .rich-text-editor::-webkit-scrollbar-track {
+        background: transparent; 
+      }
+      .rich-text-editor::-webkit-scrollbar-thumb {
+        background-color: rgba(156, 163, 175, 0.5); 
+        border-radius: 4px;
+      }
+      .dark .rich-text-editor::-webkit-scrollbar-thumb {
+        background-color: rgba(71, 85, 105, 0.8); 
+      }
+      .rich-text-editor::-webkit-scrollbar-thumb:hover {
+        background-color: rgba(99, 102, 241, 0.5); 
+      }
+
+      /* 
+         Force pasted content to inherit theme colors.
+         This preserves Bold/Italic structure but removes fixed colors 
+         (like black text) that would be invisible in dark mode.
+      */
+      .rich-text-editor * {
+        background-color: transparent !important;
+        color: inherit !important; 
+        font-family: inherit !important;
+        font-size: inherit !important;
+        line-height: inherit !important;
+      }
+    </style>
+  <script type="importmap">
+{
+  "imports": {
+    "lucide-react": "https://esm.sh/lucide-react@^0.564.0",
+    "@google/genai": "https://esm.sh/@google/genai@^1.41.0",
+    "react/": "https://esm.sh/react@^19.2.4/",
+    "react": "https://esm.sh/react@^19.2.4",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.4/"
+  }
+}
+</script>
+</head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

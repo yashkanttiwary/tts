@@ -1,0 +1,5 @@
+{
+  "name": "Gemini Voice Studio",
+  "description": "Professional Text-to-Speech generator using Gemini 2.5 Flash model with raw PCM audio processing capabilities.",
+  "requestFramePermissions": []
+}
