@@ -45,10 +45,9 @@ export const generateSpeechFromText = async (
     : `${languageDirective}\n\nText to speak:\n${config.text}`;
 
   let lastError: any;
-  // Increased retries to handle rate limits more robustly during batch processing
   const MAX_RETRIES = 5; 
   let attempt = 0;
-  let rateLimitHitCount = 0;
+  let consecutiveRateLimitHits = 0;
 
   while (true) {
     try {
@@ -82,49 +81,60 @@ export const generateSpeechFromText = async (
          throw new Error("No audio data found in response.");
       }
 
+      // Success! Reset counters
+      consecutiveRateLimitHits = 0;
       return audioPart.inlineData.data;
 
     } catch (error: any) {
       lastError = error;
       
-      // --- RATE LIMIT HANDLING (429) ---
+      // --- ROBUST RATE LIMIT HANDLING (429/503) ---
       const isRateLimit = error.status === 429 || (error.message && error.message.includes('429')) || (error.status === 503);
       
       if (isRateLimit) {
-        rateLimitHitCount++;
+        consecutiveRateLimitHits++;
         
-        // Try to parse the specific wait time from the error message
+        // 1. Parse the "official" wait time
         const waitTimeMatch = error.message?.match(/retry in (\d+(\.\d+)?)s/);
-        let waitTime = 10000; // Default wait 10s (increased from 5s)
+        let baseWaitTime = 10000; // Minimum baseline of 10s
         
         if (waitTimeMatch && waitTimeMatch[1]) {
-           // Parse the time
-           const parsedTime = parseFloat(waitTimeMatch[1]) * 1000;
-           // Add a 2s safety buffer + random jitter (0-2s)
-           // Jitter helps prevent multiple parallel chunks from retrying at the EXACT same millisecond and hitting the limit again.
-           const safetyBuffer = 2000;
-           const jitter = Math.random() * 2000;
-           
-           waitTime = Math.ceil(parsedTime + safetyBuffer + jitter);
-        } else {
-           // If we couldn't parse it, use exponential backoff based on how many times we hit it
-           waitTime = waitTime * rateLimitHitCount;
+           baseWaitTime = parseFloat(waitTimeMatch[1]) * 1000;
         }
 
-        // Active Countdown Loop
-        const totalSeconds = Math.ceil(waitTime / 1000);
+        // 2. Apply "Pessimistic Buffer" Strategy
+        // If Google says 60s, waiting exactly 60s is risky. We add:
+        // - A fixed safety buffer (5 seconds)
+        // - A percentage buffer (10% of total) to scale with longer waits
+        // - A random jitter (0-2s) to prevent synchronized retries
+        const safetyPadding = 5000; 
+        const percentagePadding = baseWaitTime * 0.10; 
+        const jitter = Math.random() * 2000;
+
+        let totalWaitTime = Math.ceil(baseWaitTime + safetyPadding + percentagePadding + jitter);
+
+        // 3. Exponential Penalty for stubborn errors
+        // If we just waited and failed AGAIN, double the wait time.
+        if (consecutiveRateLimitHits > 1) {
+          totalWaitTime = totalWaitTime * 2;
+        }
+
+        // 4. Execute the Countdown
+        const totalSeconds = Math.ceil(totalWaitTime / 1000);
         for (let i = totalSeconds; i > 0; i--) {
            if (onStatusUpdate) {
-             onStatusUpdate(`Rate limit hit. Cooling down: ${i}s...`);
+             // If this is a repeat offense, let the user know we are adding extra time
+             const extraContext = consecutiveRateLimitHits > 1 ? " (Extended wait due to retry failure)" : "";
+             onStatusUpdate(`Rate limit hit. Cooling down: ${i}s${extraContext}...`);
            }
            await delay(1000);
         }
         
-        // VISUAL FIX: Explicitly show "Retrying" state for 1.5s
-        // This ensures the user sees the timer finish and the system attempt to work again
-        // before potentially failing again.
-        if (onStatusUpdate) onStatusUpdate("Cool-down complete. Retrying...");
-        await delay(1500);
+        // 5. Visual "Verifying" Phase
+        // Instead of silently retrying, we explicitly tell the user we are checking.
+        if (onStatusUpdate) onStatusUpdate("Verifying server availability...");
+        // Pause here so the user actually reads the message and sees the state change
+        await delay(2000);
 
         continue; 
       }
@@ -132,14 +142,14 @@ export const generateSpeechFromText = async (
       // --- STANDARD ERROR HANDLING ---
       console.warn(`TTS generation attempt ${attempt} failed:`, error);
 
-      // Don't retry client errors
+      // Don't retry client errors (Bad Request, Forbidden, Not Found)
       if (error.status === 400 || error.status === 403 || (error.message && (error.message.includes("400") || error.message.includes("403") || error.message.includes("404")))) {
         break;
       }
       
       if (attempt < MAX_RETRIES) {
         const backoff = 1000 * Math.pow(2, attempt);
-        if (onStatusUpdate) onStatusUpdate(`Error. Retrying in ${backoff/1000}s...`);
+        if (onStatusUpdate) onStatusUpdate(`Connection glitch. Retrying in ${backoff/1000}s...`);
         await delay(backoff);
       } else {
         break; // Give up
