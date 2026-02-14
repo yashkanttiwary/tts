@@ -25,8 +25,9 @@ export const generateSpeechFromText = async (
   }
 
   const ai = new GoogleGenAI({ apiKey: keyToUse });
-  // Switched to Gemini 2.5 Pro as requested
-  const modelName = "gemini-2.5-pro";
+  
+  // Reverted to Flash TTS model for speed and higher rate limits
+  const modelName = "gemini-2.5-flash-preview-tts";
 
   // Language direction logic
   let languageDirective = "";
@@ -44,8 +45,8 @@ export const generateSpeechFromText = async (
     : `${languageDirective}\n\nText to speak:\n${config.text}`;
 
   let lastError: any;
-  // Infinite retries for Rate Limits (within reason), finite for others
-  const MAX_RETRIES = 3; 
+  // Increased retries to handle rate limits more robustly during batch processing
+  const MAX_RETRIES = 5; 
   let attempt = 0;
 
   while (true) {
@@ -90,24 +91,23 @@ export const generateSpeechFromText = async (
       
       if (isRateLimit) {
         // Try to parse the specific wait time from the error message
-        // Example: "Please retry in 52.232015042s"
         const waitTimeMatch = error.message?.match(/retry in (\d+(\.\d+)?)s/);
-        let waitTime = 30000; // Default wait 30s if we can't parse it
+        let waitTime = 5000; // Default wait 5s for Flash (usually recovers faster than Pro)
         
         if (waitTimeMatch && waitTimeMatch[1]) {
-           // Add 1s buffer to be safe
-           waitTime = Math.ceil(parseFloat(waitTimeMatch[1])) * 1000 + 2000;
+           // Add buffer
+           waitTime = Math.ceil(parseFloat(waitTimeMatch[1])) * 1000 + 1000;
         }
 
         const waitSeconds = Math.ceil(waitTime / 1000);
-        console.warn(`Rate limit hit. Pausing for ${waitSeconds}s before retrying...`);
         
         if (onStatusUpdate) {
-          onStatusUpdate(`Rate limit hit (Free Tier). Pausing for ${waitSeconds}s...`);
+          onStatusUpdate(`Rate limit hit. Cooling down for ${waitSeconds}s...`);
         }
-
+        
+        // Wait and then retry
         await delay(waitTime);
-        continue; // Retry loop without incrementing "attempt" counter effectively allowing infinite rate limit retries
+        continue; 
       }
 
       // --- STANDARD ERROR HANDLING ---
@@ -118,10 +118,8 @@ export const generateSpeechFromText = async (
         break;
       }
       
-      // Standard exponential backoff for other errors (500s)
       if (attempt < MAX_RETRIES) {
         const backoff = 1000 * Math.pow(2, attempt);
-        if (onStatusUpdate) onStatusUpdate(`Error occurred. Retrying in ${backoff/1000}s...`);
         await delay(backoff);
       } else {
         break; // Give up

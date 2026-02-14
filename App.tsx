@@ -11,8 +11,11 @@ import ApiKeyModal from './components/ApiKeyModal';
 // Increased limit for "Book Mode"
 const MAX_CHARS = 500000;
 const CHUNK_SIZE = 1000; 
-// Batch size set to 1 for sequential processing to handle rate limits gracefully
-const BATCH_SIZE = 1;    
+
+// Batch size 3: A "Safe Speed" Workaround.
+// Processing 3 chunks at once is much faster than 1, but low enough 
+// to avoid immediate rate limiting on the Flash model.
+const BATCH_SIZE = 3;    
 
 const VOICES: VoiceOption[] = [
   { name: 'Puck', gender: 'Male', style: 'Upbeat & Playful', description: 'Great for storytelling and lively content.' },
@@ -221,32 +224,49 @@ export default function App() {
       const pcmChunks: Uint8Array[] = new Array(chunks.length);
       const totalChunks = chunks.length;
 
-      // Sequential processing to respect strict rate limits
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
+      // WORKAROUND: Batch Processing Loop
+      // Instead of processing 1 by 1, we process in batches defined by BATCH_SIZE.
+      // This increases throughput while keeping a check on concurrency.
+      for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
         
-        setProgressMessage(`Processing part ${i + 1} of ${totalChunks}...`);
-
-        // We pass setProgressMessage to the service so it can update us if it hits a rate limit wait
-        const base64Audio = await generateSpeechFromText({
-          text: chunk,
-          instruction,
-          voice: selectedVoice,
-          language: selectedLanguage
-        }, apiKey, (statusMsg) => setProgressMessage(`Part ${i + 1}/${totalChunks}: ${statusMsg}`));
-
-        const pcmData = base64ToUint8Array(base64Audio);
-        pcmChunks[i] = pcmData;
-
-        // --- LIVE PREVIEW ---
-        // If enabled, play this chunk immediately while the next one generates
-        if (livePreview && audioContextRef.current) {
-          playChunkLive(pcmData);
+        // Prepare current batch
+        const batchIndices: number[] = [];
+        for (let j = 0; j < BATCH_SIZE && i + j < chunks.length; j++) {
+          batchIndices.push(i + j);
         }
 
-        // Optional: Artificial small delay between successful chunks to be nice to the API
-        if (i < chunks.length - 1) {
-           await new Promise(r => setTimeout(r, 500));
+        setProgressMessage(`Processing batch ${Math.ceil((i + 1) / BATCH_SIZE)} of ${Math.ceil(totalChunks / BATCH_SIZE)}...`);
+
+        // Create promises for the batch
+        const promises = batchIndices.map(idx => {
+          return generateSpeechFromText({
+            text: chunks[idx],
+            instruction,
+            voice: selectedVoice,
+            language: selectedLanguage
+          }, apiKey, (statusMsg) => {
+             // Only update status if it's a rate limit warning, otherwise it flickers too much in parallel
+             if (statusMsg.includes('limit')) setProgressMessage(statusMsg);
+          });
+        });
+
+        // Wait for all requests in this batch to finish
+        const results = await Promise.all(promises);
+
+        // Process results in correct order to maintain audio sequence
+        results.forEach((base64Audio, localIdx) => {
+          const globalIdx = batchIndices[localIdx];
+          const pcmData = base64ToUint8Array(base64Audio);
+          pcmChunks[globalIdx] = pcmData;
+          
+          if (livePreview) {
+             playChunkLive(pcmData);
+          }
+        });
+
+        // Small breathing room between batches to be nice to the API
+        if (i + BATCH_SIZE < chunks.length) {
+          await new Promise(r => setTimeout(r, 200)); 
         }
       }
 
@@ -266,7 +286,6 @@ export default function App() {
       setProgressMessage('');
     } finally {
       // We don't close the audio context here immediately because the audio might still be playing from the buffer
-      // However, we can let it garbage collect or close it when the new generation starts
     }
   };
 
@@ -289,7 +308,7 @@ export default function App() {
             <div className="text-center md:text-left space-y-2">
               <div className="inline-flex items-center gap-2 bg-white/80 dark:bg-slate-800/80 backdrop-blur border border-slate-200 dark:border-slate-700/50 px-3 py-1 rounded-full text-xs font-semibold text-indigo-600 dark:text-indigo-300 shadow-sm">
                 <Sparkles className="w-3.5 h-3.5" />
-                <span>Gemini 2.5 Pro</span>
+                <span>Gemini 2.5 Flash TTS</span>
               </div>
               <h1 className="text-3xl md:text-4xl font-extrabold tracking-tight text-slate-900 dark:text-white">
                 Gemini Voice Studio
