@@ -48,6 +48,7 @@ export const generateSpeechFromText = async (
   // Increased retries to handle rate limits more robustly during batch processing
   const MAX_RETRIES = 5; 
   let attempt = 0;
+  let rateLimitHitCount = 0;
 
   while (true) {
     try {
@@ -90,25 +91,41 @@ export const generateSpeechFromText = async (
       const isRateLimit = error.status === 429 || (error.message && error.message.includes('429')) || (error.status === 503);
       
       if (isRateLimit) {
+        rateLimitHitCount++;
+        
         // Try to parse the specific wait time from the error message
         const waitTimeMatch = error.message?.match(/retry in (\d+(\.\d+)?)s/);
-        let waitTime = 5000; // Default wait 5s for Flash (usually recovers faster than Pro)
+        let waitTime = 10000; // Default wait 10s (increased from 5s)
         
         if (waitTimeMatch && waitTimeMatch[1]) {
-           // Add buffer
-           waitTime = Math.ceil(parseFloat(waitTimeMatch[1])) * 1000 + 1000;
+           // Parse the time
+           const parsedTime = parseFloat(waitTimeMatch[1]) * 1000;
+           // Add a 2s safety buffer + random jitter (0-2s)
+           // Jitter helps prevent multiple parallel chunks from retrying at the EXACT same millisecond and hitting the limit again.
+           const safetyBuffer = 2000;
+           const jitter = Math.random() * 2000;
+           
+           waitTime = Math.ceil(parsedTime + safetyBuffer + jitter);
+        } else {
+           // If we couldn't parse it, use exponential backoff based on how many times we hit it
+           waitTime = waitTime * rateLimitHitCount;
         }
 
         // Active Countdown Loop
-        // Instead of sleeping for the whole duration, we tick down every second so the UI updates
         const totalSeconds = Math.ceil(waitTime / 1000);
         for (let i = totalSeconds; i > 0; i--) {
            if (onStatusUpdate) {
-             onStatusUpdate(`Rate limit hit. Cooling down: ${i}s remaining...`);
+             onStatusUpdate(`Rate limit hit. Cooling down: ${i}s...`);
            }
            await delay(1000);
         }
         
+        // VISUAL FIX: Explicitly show "Retrying" state for 1.5s
+        // This ensures the user sees the timer finish and the system attempt to work again
+        // before potentially failing again.
+        if (onStatusUpdate) onStatusUpdate("Cool-down complete. Retrying...");
+        await delay(1500);
+
         continue; 
       }
 
