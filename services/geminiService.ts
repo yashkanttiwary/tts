@@ -99,14 +99,16 @@ export const generateSpeechFromText = async (
            waitTime = Math.ceil(parseFloat(waitTimeMatch[1])) * 1000 + 1000;
         }
 
-        const waitSeconds = Math.ceil(waitTime / 1000);
-        
-        if (onStatusUpdate) {
-          onStatusUpdate(`Rate limit hit. Cooling down for ${waitSeconds}s...`);
+        // Active Countdown Loop
+        // Instead of sleeping for the whole duration, we tick down every second so the UI updates
+        const totalSeconds = Math.ceil(waitTime / 1000);
+        for (let i = totalSeconds; i > 0; i--) {
+           if (onStatusUpdate) {
+             onStatusUpdate(`Rate limit hit. Cooling down: ${i}s remaining...`);
+           }
+           await delay(1000);
         }
         
-        // Wait and then retry
-        await delay(waitTime);
         continue; 
       }
 
@@ -120,6 +122,7 @@ export const generateSpeechFromText = async (
       
       if (attempt < MAX_RETRIES) {
         const backoff = 1000 * Math.pow(2, attempt);
+        if (onStatusUpdate) onStatusUpdate(`Error. Retrying in ${backoff/1000}s...`);
         await delay(backoff);
       } else {
         break; // Give up

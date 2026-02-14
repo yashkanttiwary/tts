@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle } from 'lucide-react';
+import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus } from './types';
 import { generateSpeechFromText } from './services/geminiService';
 import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
@@ -246,7 +246,7 @@ export default function App() {
             language: selectedLanguage
           }, apiKey, (statusMsg) => {
              // Only update status if it's a rate limit warning, otherwise it flickers too much in parallel
-             if (statusMsg.includes('limit')) setProgressMessage(statusMsg);
+             if (statusMsg.includes('limit') || statusMsg.includes('Cooling')) setProgressMessage(statusMsg);
           });
         });
 
@@ -290,6 +290,7 @@ export default function App() {
   };
 
   const isLoading = status === TTSStatus.GENERATING;
+  const isRateLimit = progressMessage.toLowerCase().includes('cooling') || progressMessage.toLowerCase().includes('limit');
 
   return (
     <div className={isDarkMode ? 'dark' : ''}>
@@ -506,10 +507,22 @@ export default function App() {
                     ) : (
                       <div className="w-full text-center text-sm text-slate-500 dark:text-slate-500 italic flex items-center justify-center gap-2">
                          {isLoading ? (
-                           <div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400">
-                             {livePreview && <Volume2 className="w-4 h-4 animate-pulse" />}
-                             <span className="animate-pulse font-medium">{progressMessage || 'Initializing...'}</span>
-                           </div>
+                           isRateLimit ? (
+                             <div className="flex flex-col items-center justify-center gap-2 py-2 animate-pulse">
+                               <div className="flex items-center gap-2 text-amber-600 dark:text-amber-500 font-bold">
+                                 <Clock className="w-5 h-5" />
+                                 <span>API Cool-down Active</span>
+                               </div>
+                               <p className="text-xs text-amber-600/80 dark:text-amber-400 font-mono">
+                                 {progressMessage}
+                               </p>
+                             </div>
+                           ) : (
+                             <div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400">
+                               {livePreview && <Volume2 className="w-4 h-4 animate-pulse" />}
+                               <span className="animate-pulse font-medium">{progressMessage || 'Initializing...'}</span>
+                             </div>
+                           )
                          ) : (
                            'Ready to generate'
                          )}
