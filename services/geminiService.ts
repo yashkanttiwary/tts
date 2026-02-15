@@ -38,8 +38,8 @@ export const generateSpeechFromText = async (
     throw new Error("API Key is missing. Please click the 'Connect API' button to configure it.");
   }
 
-  // Reverted to Flash TTS model for speed and higher rate limits
-  const modelName = "gemini-2.5-flash-preview-tts";
+  // Switched to Gemini 2.0 Flash
+  const modelName = "gemini-2.0-flash";
 
   // Language direction logic
   let languageDirective = "";
