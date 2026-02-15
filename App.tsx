@@ -1,6 +1,6 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save } from 'lucide-react';
+import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save, Layers } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus } from './types';
 import { generateSpeechFromText } from './services/geminiService';
 import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
@@ -9,9 +9,13 @@ import StylePresets from './components/StylePresets';
 import LanguageSelector from './components/LanguageSelector';
 import ApiKeyModal from './components/ApiKeyModal';
 
-// Increased limit for "Book Mode"
+// STRATEGY 1: Increase Chunk Size to reduce request frequency
 const MAX_CHARS = 500000;
-const CHUNK_SIZE = 1000; 
+const CHUNK_SIZE = 3000; 
+
+// STRATEGY 4: Hardcoded Request Limit
+const MAX_RPM_PER_KEY = 9; 
+const RATE_WINDOW_MS = 60000; // 1 Minute
 
 const VOICES: VoiceOption[] = [
   { name: 'Puck', gender: 'Male', style: 'Upbeat & Playful', description: 'Great for storytelling and lively content.' },
@@ -56,12 +60,13 @@ function splitTextIdeally(text: string, maxLength: number): string[] {
 export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(false);
   
-  // API Key State
-  const [apiKey, setApiKey] = useState('');
-  // We use a ref for the API key so the running async loop can access the LATEST value
-  // even if the user updates it while the loop is running (hot-swap)
-  const apiKeyRef = useRef('');
+  // API Key State (Now supports multiple keys)
+  const [apiKeys, setApiKeys] = useState<string[]>([]);
+  const apiKeysRef = useRef<string[]>([]); // Ref for hot-swapping access
   const [isApiModalOpen, setIsApiModalOpen] = useState(false);
+
+  // Rate Limiting History Ref: Record<ApiKey, Timestamp[]>
+  const requestHistoryRef = useRef<Record<string, number[]>>({});
 
   // Content State
   const [text, setText] = useState('Welcome to the Gemini Voice Studio. I can transform any text into lifelike speech.\n\nSelect Hindi from the menu to hear me speak in a native Indian accent. I will highlight the text as I read it.');
@@ -81,7 +86,6 @@ export default function App() {
   const [progress, setProgress] = useState(0); // 0-100
   const [processedChunks, setProcessedChunks] = useState(0);
   const [totalChunksCount, setTotalChunksCount] = useState(0);
-  // Ref to hold PCM chunks for immediate partial download without re-rendering
   const pcmChunksRef = useRef<Uint8Array[]>([]);
 
   // Playback State
@@ -91,17 +95,16 @@ export default function App() {
   
   const audioRef = useRef<HTMLAudioElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
-  
-  // Refs for Live Preview (Web Audio API)
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextAudioStartTimeRef = useRef<number>(0);
 
-  // Load API key from local storage on mount
+  // Load API keys
   useEffect(() => {
-    const storedKey = localStorage.getItem('gemini_api_key');
-    if (storedKey) {
-      setApiKey(storedKey);
-      apiKeyRef.current = storedKey;
+    const storedKeys = localStorage.getItem('gemini_api_keys');
+    if (storedKeys) {
+      const parsed = JSON.parse(storedKeys);
+      setApiKeys(parsed);
+      apiKeysRef.current = parsed;
     }
   }, []);
 
@@ -114,14 +117,12 @@ export default function App() {
     };
   }, [audioUrl]);
 
-  // Handle playback rate updates
   useEffect(() => {
      if (audioRef.current) {
        audioRef.current.playbackRate = playbackRate;
      }
   }, [playbackRate]);
 
-  // Initial content setup
   useEffect(() => {
     if (editorRef.current && text && editorRef.current.innerText === '') {
       editorRef.current.innerText = text;
@@ -134,16 +135,18 @@ export default function App() {
     }
   };
 
-  const handleSaveApiKey = (key: string) => {
-    setApiKey(key);
-    apiKeyRef.current = key; // Update Ref for hot-swap
-    localStorage.setItem('gemini_api_key', key);
+  const handleSaveApiKeys = (keysString: string) => {
+    // Split by newlines or commas, trim whitespace, filter empty
+    const keys = keysString.split(/[\n,]+/).map(k => k.trim()).filter(k => k.length > 0);
+    setApiKeys(keys);
+    apiKeysRef.current = keys;
+    localStorage.setItem('gemini_api_keys', JSON.stringify(keys));
   };
 
   const handleDisconnectApiKey = () => {
-    setApiKey('');
-    apiKeyRef.current = '';
-    localStorage.removeItem('gemini_api_key');
+    setApiKeys([]);
+    apiKeysRef.current = [];
+    localStorage.removeItem('gemini_api_keys');
   };
 
   const handleDownload = () => {
@@ -163,7 +166,6 @@ export default function App() {
       const wavBuffer = pcmToWav(mergedPcm.buffer);
       const blob = new Blob([wavBuffer], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
-      
       const link = document.createElement('a');
       link.href = url;
       link.download = `gemini-speech-partial-${processedChunks}-chunks.wav`;
@@ -176,8 +178,43 @@ export default function App() {
     }
   };
 
-  // --- LIVE PREVIEW LOGIC ---
+  // --- SMART THROTTLING LOGIC ---
+  const checkAndThrottle = async (key: string) => {
+    const now = Date.now();
+    // Initialize history for this key if needed
+    if (!requestHistoryRef.current[key]) {
+      requestHistoryRef.current[key] = [];
+    }
 
+    // 1. Clean up old timestamps (older than 1 minute)
+    requestHistoryRef.current[key] = requestHistoryRef.current[key].filter(
+      timestamp => now - timestamp < RATE_WINDOW_MS
+    );
+
+    // 2. Check if we hit the limit
+    const history = requestHistoryRef.current[key];
+    if (history.length >= MAX_RPM_PER_KEY) {
+      // We are maxed out. Calculate time until the oldest request expires.
+      // The oldest request is history[0] because we append to the end.
+      const oldestRequestTime = history[0];
+      const timeSinceOldest = now - oldestRequestTime;
+      const waitTime = RATE_WINDOW_MS - timeSinceOldest + 1000; // +1s buffer
+
+      if (waitTime > 0) {
+        // Wait...
+        const seconds = Math.ceil(waitTime / 1000);
+        for (let i = seconds; i > 0; i--) {
+           setProgressMessage(`Throttling: Waiting ${i}s for key capacity...`);
+           await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+    }
+
+    // 3. Record this new request (Optimistic recording)
+    requestHistoryRef.current[key].push(Date.now());
+  };
+
+  // --- LIVE PREVIEW LOGIC ---
   const initAudioContext = () => {
     if (!livePreview) return;
     try {
@@ -196,21 +233,16 @@ export default function App() {
 
   const playChunkLive = (pcmData: Uint8Array) => {
     if (!audioContextRef.current || !livePreview) return;
-    
     try {
       const ctx = audioContextRef.current;
-      
       const float32Data = convertInt16ToFloat32(pcmData);
       const buffer = ctx.createBuffer(1, float32Data.length, 24000);
       buffer.getChannelData(0).set(float32Data);
-
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       source.connect(ctx.destination);
-
       const startTime = Math.max(ctx.currentTime, nextAudioStartTimeRef.current);
       source.start(startTime);
-      
       nextAudioStartTimeRef.current = startTime + buffer.duration;
     } catch (e) {
       console.warn("Live preview scheduling error:", e);
@@ -219,7 +251,6 @@ export default function App() {
 
   const togglePreviewPause = () => {
     if (!audioContextRef.current) return;
-    
     if (audioContextRef.current.state === 'running') {
       audioContextRef.current.suspend();
       setIsPreviewPaused(true);
@@ -230,15 +261,9 @@ export default function App() {
   };
 
   const handleGenerate = async () => {
-    let envKey = '';
-    try {
-      if (typeof process !== 'undefined' && process.env && process.env.API_KEY) {
-        envKey = process.env.API_KEY;
-      }
-    } catch (e) {}
-
-    // Check if we have a key (either in state, ref, or env)
-    if (!apiKey && !apiKeyRef.current && !envKey) {
+    // Check keys
+    let keysToUse = apiKeysRef.current;
+    if (keysToUse.length === 0) {
       setIsApiModalOpen(true);
       return;
     }
@@ -251,14 +276,11 @@ export default function App() {
     setError('');
     setProgress(0);
     setProcessedChunks(0);
-    pcmChunksRef.current = []; // Clear previous buffer
+    pcmChunksRef.current = []; 
     if (audioUrl) URL.revokeObjectURL(audioUrl);
     setAudioUrl(null);
 
-    // Initialize Audio
     initAudioContext();
-    
-    // Create new abort controller for this run
     const controller = new AbortController();
     setAbortController(controller);
 
@@ -268,53 +290,50 @@ export default function App() {
 
       // --- SEQUENTIAL PROCESSING ---
       for (let i = 0; i < chunks.length; i++) {
-        // Check if cancelled
-        if (controller.signal.aborted) {
-          throw new Error("Generation cancelled by user.");
-        }
+        if (controller.signal.aborted) throw new Error("Generation cancelled.");
 
-        // Update timeline text
-        setProgressMessage(`Rendering segment ${i + 1} of ${chunks.length}`);
+        // STRATEGY 2: KEY ROTATION
+        // We get the latest keys from ref inside loop to allow hot-swapping
+        const currentKeys = apiKeysRef.current;
+        if (currentKeys.length === 0) throw new Error("No API keys available.");
+        
+        // Round Robin selection
+        const keyIndex = i % currentKeys.length;
+        const currentKey = currentKeys[keyIndex];
 
-        // SMART PROMPTING: Get context from previous chunk (if exists)
+        // STRATEGY 4: SMART THROTTLING
+        // Check if THIS specific key needs to wait
+        await checkAndThrottle(currentKey);
+
+        setProgressMessage(`Rendering segment ${i + 1} of ${chunks.length} (Key ${keyIndex + 1})`);
+
         const previousContext = i > 0 ? chunks[i-1].slice(-200) : undefined;
 
         // Generate
-        // CRITICAL: We pass a FUNCTION returning the key. This allows the service 
-        // to get the new key if the user updates it during a rate-limit wait loop.
+        // We pass the specific key rotated for this chunk
         const base64Audio = await generateSpeechFromText({
           text: chunks[i],
           instruction,
           voice: selectedVoice,
           language: selectedLanguage,
           previousContext: previousContext,
-        }, () => apiKeyRef.current, (statusMsg) => {
-           // Only show rate limit messages in the UI, otherwise keep the "Rendering segment X" message
+        }, currentKey, (statusMsg) => {
            if (statusMsg.includes('limit') || statusMsg.includes('Cooling') || statusMsg.includes('Verifying')) {
              setProgressMessage(statusMsg);
            }
         });
 
-        // Check if cancelled during await
         if (controller.signal.aborted) throw new Error("Cancelled.");
 
-        // Process Result
         const pcmData = base64ToUint8Array(base64Audio);
-        
-        // Store in Ref for partial download and final stitch
         pcmChunksRef.current.push(pcmData);
         
-        // Live Preview
-        if (livePreview) {
-           playChunkLive(pcmData);
-        }
+        if (livePreview) playChunkLive(pcmData);
 
-        // Update Timeline
         setProcessedChunks(i + 1);
         setProgress(((i + 1) / chunks.length) * 100);
       }
 
-      // Stitch
       setProgressMessage('Finalizing audio...');
       const mergedPcm = mergeBuffers(pcmChunksRef.current);
       const wavBuffer = pcmToWav(mergedPcm.buffer);
@@ -326,9 +345,9 @@ export default function App() {
       setProgressMessage('');
 
     } catch (err: any) {
-      if (err.message === "Cancelled." || err.message.includes("cancelled")) {
+      if (err.message === "Cancelled." || err.message.includes("cancelled") || err.message.includes("Generation cancelled")) {
         setStatus(TTSStatus.IDLE);
-        setProgressMessage('');
+        setProgressMessage('Stopped by user.');
       } else {
         setError(err.message || "An unexpected error occurred.");
         setStatus(TTSStatus.ERROR);
@@ -340,21 +359,18 @@ export default function App() {
   };
 
   const handleStop = () => {
-    if (abortController) {
-      abortController.abort();
-    }
+    if (abortController) abortController.abort();
     if (audioContextRef.current) {
       audioContextRef.current.close();
       audioContextRef.current = null;
     }
     setStatus(TTSStatus.IDLE);
-    // Do NOT clear processedChunks or chunksRef here immediately 
-    // so user can see what they stopped at, but we reset status.
-    setProgressMessage('Stopped by user.');
+    setProgressMessage('Stopped.');
   };
 
   const isGenerating = status === TTSStatus.GENERATING;
-  const isRateLimit = progressMessage.toLowerCase().includes('cooling') || progressMessage.toLowerCase().includes('limit');
+  const isRateLimit = progressMessage.toLowerCase().includes('cooling') || progressMessage.toLowerCase().includes('limit') || progressMessage.toLowerCase().includes('throttling');
+  const keyCount = apiKeys.length;
 
   return (
     <div className={isDarkMode ? 'dark' : ''}>
@@ -388,15 +404,19 @@ export default function App() {
                 onClick={() => setIsApiModalOpen(true)}
                 className={`
                   flex items-center gap-2 px-4 py-2.5 rounded-full border text-sm font-medium transition-all shadow-sm
-                  ${apiKey 
+                  ${keyCount > 0 
                     ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300 hover:bg-green-100 dark:hover:bg-green-900/40' 
                     : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:border-indigo-300 dark:hover:border-slate-600'
                   }
                   ${isGenerating && isRateLimit ? 'animate-pulse ring-2 ring-amber-400 border-amber-400' : ''}
                 `}
               >
-                {apiKey ? <Check className="w-4 h-4" /> : <Key className="w-4 h-4" />}
-                <span>{apiKey ? (isRateLimit ? 'Change Key (Hot Swap)' : 'API Connected') : 'Connect API'}</span>
+                {keyCount > 0 ? (keyCount > 1 ? <Layers className="w-4 h-4" /> : <Check className="w-4 h-4" />) : <Key className="w-4 h-4" />}
+                <span>
+                  {keyCount > 0 
+                    ? (isRateLimit ? 'Add More Keys' : `${keyCount} Key${keyCount > 1 ? 's' : ''} Active`) 
+                    : 'Connect API'}
+                </span>
               </button>
 
               <button
@@ -441,9 +461,9 @@ export default function App() {
                    <Wand2 className="w-4 h-4 text-indigo-600 dark:text-indigo-300" />
                  </div>
                  <div>
-                   <h3 className="text-sm font-bold text-indigo-900 dark:text-indigo-200 mb-1">Smart Cohesion</h3>
+                   <h3 className="text-sm font-bold text-indigo-900 dark:text-indigo-200 mb-1">Smart Optimization</h3>
                    <p className="text-xs text-indigo-700/80 dark:text-indigo-300/70 leading-relaxed">
-                     We now process segments sequentially, passing the previous sentence as context. This ensures consistent tone and flow across long documents.
+                     Key Rotation & Request Throttling are active. We intelligently rotate your keys and wait exactly when needed to prevent API blocks.
                    </p>
                  </div>
               </div>
@@ -525,11 +545,11 @@ export default function App() {
                         <div className="flex items-center gap-2">
                            {isRateLimit ? (
                              <span className="text-xs text-amber-600 dark:text-amber-400 font-bold flex items-center gap-1">
-                               <Clock className="w-3 h-3" /> Cool-down
+                               <Clock className="w-3 h-3" /> {progressMessage}
                              </span>
                            ) : (
                              <span className="text-xs text-indigo-600 dark:text-indigo-400 flex items-center gap-1">
-                               <Loader2 className="w-3 h-3 animate-spin" /> Rendering
+                               <Loader2 className="w-3 h-3 animate-spin" /> {progressMessage || 'Rendering...'}
                              </span>
                            )}
                         </div>
@@ -642,9 +662,9 @@ export default function App() {
           <ApiKeyModal 
             isOpen={isApiModalOpen}
             onClose={() => setIsApiModalOpen(false)}
-            onSave={handleSaveApiKey}
+            onSave={handleSaveApiKeys}
             onDisconnect={handleDisconnectApiKey}
-            hasKey={!!apiKey}
+            hasKey={keyCount > 0}
           />
         </div>
       </div>
