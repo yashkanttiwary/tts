@@ -8,21 +8,22 @@ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const DEFAULT_STYLE = "Great storyteller, perfect YouTuber delivering the narratives as they land most effectively with sometimes high-pitched, low-pitched modulations, as for perfect timings";
 
 // Helper to get key from string or function
-const resolveKey = (keyOrProvider: string | (() => string)): string => {
+// Now supports passing a 'peek' flag to check next key without side effects (like recording usage)
+const resolveKey = (keyOrProvider: string | ((peek?: boolean) => string), peek: boolean = false): string => {
   if (typeof keyOrProvider === 'function') {
-    return keyOrProvider();
+    return keyOrProvider(peek);
   }
   return keyOrProvider;
 };
 
 export const generateSpeechFromText = async (
   config: GenerationConfig, 
-  apiKeyOrProvider: string | (() => string),
+  apiKeyOrProvider: string | ((peek?: boolean) => string),
   onStatusUpdate?: (msg: string) => void
 ): Promise<string> => {
   
   // Initial check
-  let currentKey = resolveKey(apiKeyOrProvider);
+  let currentKey = resolveKey(apiKeyOrProvider, false);
 
   // Fallback to env if not provided
   try {
@@ -84,7 +85,7 @@ ${config.text}
       // DYNAMIC KEY RE-FETCH:
       // We fetch the key *inside* the loop. If the user changed the key in the UI
       // while we were waiting in the 'catch' block below, this will pick up the NEW key.
-      currentKey = resolveKey(apiKeyOrProvider);
+      currentKey = resolveKey(apiKeyOrProvider, false);
       
       const ai = new GoogleGenAI({ apiKey: currentKey });
 
@@ -151,19 +152,40 @@ ${config.text}
           totalWaitTime = totalWaitTime * 2;
         }
 
-        // 4. Execute the Countdown
+        // 4. Execute the Countdown with POLL LOGIC
         const totalSeconds = Math.ceil(totalWaitTime / 1000);
+        
+        // Flag to check if we broke out due to key switch
+        let switchedKey = false;
+
         for (let i = totalSeconds; i > 0; i--) {
+           // Poll for key change every second
+           if (typeof apiKeyOrProvider === 'function') {
+             // Pass true to 'peek' without triggering side effects like usage counting
+             const freshKey = resolveKey(apiKeyOrProvider, true);
+             if (freshKey && freshKey !== currentKey) {
+               if (onStatusUpdate) onStatusUpdate("Skipping wait... switching to fresh API Key!");
+               await delay(800); 
+               switchedKey = true;
+               break; // EXIT THE WAIT LOOP IMMEDIATELY
+             }
+           }
+
            if (onStatusUpdate) {
              const extraContext = consecutiveRateLimitHits > 1 ? " (Extended wait)" : "";
-             onStatusUpdate(`Rate limit hit. Cooling down: ${i}s${extraContext}... (You can change API Key now)`);
+             onStatusUpdate(`Rate limit hit. Cooling down: ${i}s${extraContext}... (Click 'Skip Key' to bypass)`);
            }
            await delay(1000);
         }
         
+        // If we switched keys, continue loop immediately (which re-fetches key)
+        if (switchedKey) {
+          continue;
+        }
+
         // 5. Visual "Verifying" Phase
-        if (onStatusUpdate) onStatusUpdate("Verifying server availability (checking new key if changed)...");
-        await delay(2000);
+        if (onStatusUpdate) onStatusUpdate("Verifying server availability...");
+        await delay(1000);
 
         continue; 
       }
