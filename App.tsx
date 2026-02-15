@@ -1,5 +1,6 @@
+
 import React, { useState, useRef, useEffect } from 'react';
-import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock } from 'lucide-react';
+import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus } from './types';
 import { generateSpeechFromText } from './services/geminiService';
 import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
@@ -12,11 +13,6 @@ import ApiKeyModal from './components/ApiKeyModal';
 const MAX_CHARS = 500000;
 const CHUNK_SIZE = 1000; 
 
-// Batch size 3: A "Safe Speed" Workaround.
-// Processing 3 chunks at once is much faster than 1, but low enough 
-// to avoid immediate rate limiting on the Flash model.
-const BATCH_SIZE = 3;    
-
 const VOICES: VoiceOption[] = [
   { name: 'Puck', gender: 'Male', style: 'Upbeat & Playful', description: 'Great for storytelling and lively content.' },
   { name: 'Kore', gender: 'Female', style: 'Firm & Clear', description: 'Excellent for educational and instructional content.' },
@@ -26,6 +22,7 @@ const VOICES: VoiceOption[] = [
 ];
 
 const PRESETS: PresetOption[] = [
+  { label: 'YouTuber (Default)', prompt: 'Great storyteller, perfect YouTuber delivering the narratives as they land most effectively with sometimes high-pitched, low-pitched modulations, as for perfect timings' },
   { label: 'Storyteller', prompt: 'Read this slowly and dramatically, emphasizing the emotions:' },
   { label: 'News Anchor', prompt: 'Read this in a professional, neutral, and fast-paced broadcast tone:' },
   { label: 'Excited', prompt: 'Say this with extreme excitement and high energy, almost shouting with joy:' },
@@ -75,10 +72,17 @@ export default function App() {
   const [progressMessage, setProgressMessage] = useState('');
   const [error, setError] = useState('');
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
-  
+  const [abortController, setAbortController] = useState<AbortController | null>(null);
+
+  // Timeline State
+  const [progress, setProgress] = useState(0); // 0-100
+  const [processedChunks, setProcessedChunks] = useState(0);
+  const [totalChunksCount, setTotalChunksCount] = useState(0);
+
   // Playback State
   const [playbackRate, setPlaybackRate] = useState(1.0);
   const [livePreview, setLivePreview] = useState(true);
+  const [isPreviewPaused, setIsPreviewPaused] = useState(false);
   
   const audioRef = useRef<HTMLAudioElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
@@ -102,25 +106,21 @@ export default function App() {
     };
   }, [audioUrl]);
 
-  // Handle auto-play and playback rate application
+  // Handle playback rate updates for live preview
   useEffect(() => {
-    if (audioRef.current) {
-      audioRef.current.playbackRate = playbackRate;
-      
-      // Only auto-play the final stitched audio if we DIDN'T just listen to it live
-      // Otherwise it's annoying to hear it start over immediately
-      if (status === TTSStatus.SUCCESS && audioUrl && !livePreview) {
-        audioRef.current.play().catch(e => console.log("Auto-play blocked"));
-      }
-    }
-  }, [status, audioUrl, playbackRate, livePreview]);
+     // NOTE: Web Audio API playbackRate is harder to change dynamically on already scheduled nodes 
+     // without keeping track of every source node. 
+     // For this version, playbackRate primarily affects the final audio element.
+     if (audioRef.current) {
+       audioRef.current.playbackRate = playbackRate;
+     }
+  }, [playbackRate]);
 
   // Initial content setup
   useEffect(() => {
     if (editorRef.current && text && editorRef.current.innerText === '') {
       editorRef.current.innerText = text;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleInput = () => {
@@ -149,40 +149,60 @@ export default function App() {
     document.body.removeChild(link);
   };
 
-  // Helper to play a single PCM chunk immediately
+  // --- LIVE PREVIEW LOGIC ---
+
+  const initAudioContext = () => {
+    if (!livePreview) return;
+    try {
+      if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        audioContextRef.current = new AudioContextClass();
+        nextAudioStartTimeRef.current = audioContextRef.current.currentTime;
+      } else if (audioContextRef.current.state === 'suspended') {
+        audioContextRef.current.resume();
+      }
+      setIsPreviewPaused(false);
+    } catch (e) {
+      console.warn("Web Audio API error:", e);
+    }
+  };
+
   const playChunkLive = (pcmData: Uint8Array) => {
-    if (!audioContextRef.current) return;
+    if (!audioContextRef.current || !livePreview) return;
     
     try {
       const ctx = audioContextRef.current;
       
-      // Convert raw bytes to Float32 AudioBuffer
       const float32Data = convertInt16ToFloat32(pcmData);
-      
-      // Create buffer (Mono, matches array length, 24kHz sample rate of Gemini)
       const buffer = ctx.createBuffer(1, float32Data.length, 24000);
       buffer.getChannelData(0).set(float32Data);
 
-      // Create Source
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       source.connect(ctx.destination);
 
-      // Schedule Playback
-      // If we are falling behind (gap in audio), start immediately (currentTime).
-      // If we are ahead (streaming fast), append to end of queue (nextAudioStartTimeRef).
       const startTime = Math.max(ctx.currentTime, nextAudioStartTimeRef.current);
       source.start(startTime);
       
-      // Advance the pointer
       nextAudioStartTimeRef.current = startTime + buffer.duration;
     } catch (e) {
-      console.warn("Live preview error:", e);
+      console.warn("Live preview scheduling error:", e);
+    }
+  };
+
+  const togglePreviewPause = () => {
+    if (!audioContextRef.current) return;
+    
+    if (audioContextRef.current.state === 'running') {
+      audioContextRef.current.suspend();
+      setIsPreviewPaused(true);
+    } else if (audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume();
+      setIsPreviewPaused(false);
     }
   };
 
   const handleGenerate = async () => {
-    // Check for API key safely
     let envKey = '';
     try {
       if (typeof process !== 'undefined' && process.env && process.env.API_KEY) {
@@ -196,81 +216,75 @@ export default function App() {
     }
 
     const currentText = editorRef.current?.innerText || text;
-    
     if (!currentText.trim()) return;
-    if (currentText.length > MAX_CHARS) {
-      setError(`Text exceeds limit of ${MAX_CHARS.toLocaleString()} characters.`);
-      return;
-    }
 
+    // Reset State
     setStatus(TTSStatus.GENERATING);
     setError('');
+    setProgress(0);
+    setProcessedChunks(0);
     if (audioUrl) URL.revokeObjectURL(audioUrl);
     setAudioUrl(null);
 
-    // Initialize Web Audio Context for Live Preview
-    if (livePreview) {
-      try {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-        audioContextRef.current = new AudioContextClass();
-        nextAudioStartTimeRef.current = audioContextRef.current.currentTime;
-      } catch (e) {
-        console.warn("Web Audio API not supported, disabling live preview");
-      }
-    }
+    // Initialize Audio
+    initAudioContext();
+    
+    // Create new abort controller for this run
+    const controller = new AbortController();
+    setAbortController(controller);
 
     try {
       const chunks = splitTextIdeally(currentText, CHUNK_SIZE);
-      const pcmChunks: Uint8Array[] = new Array(chunks.length);
-      const totalChunks = chunks.length;
+      const pcmChunks: Uint8Array[] = [];
+      setTotalChunksCount(chunks.length);
 
-      // WORKAROUND: Batch Processing Loop
-      // Instead of processing 1 by 1, we process in batches defined by BATCH_SIZE.
-      // This increases throughput while keeping a check on concurrency.
-      for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+      // --- SEQUENTIAL PROCESSING ---
+      for (let i = 0; i < chunks.length; i++) {
+        // Check if cancelled
+        if (controller.signal.aborted) {
+          throw new Error("Generation cancelled by user.");
+        }
+
+        // Update timeline text
+        setProgressMessage(`Rendering segment ${i + 1} of ${chunks.length}`);
+
+        // SMART PROMPTING: Get context from previous chunk (if exists)
+        // We take the last ~200 characters of the previous chunk to give the AI a clue about flow
+        const previousContext = i > 0 ? chunks[i-1].slice(-200) : undefined;
+
+        // Generate
+        const base64Audio = await generateSpeechFromText({
+          text: chunks[i],
+          instruction,
+          voice: selectedVoice,
+          language: selectedLanguage,
+          previousContext: previousContext,
+        }, apiKey, (statusMsg) => {
+           // Only show rate limit messages in the UI, otherwise keep the "Rendering segment X" message
+           if (statusMsg.includes('limit') || statusMsg.includes('Cooling') || statusMsg.includes('Verifying')) {
+             setProgressMessage(statusMsg);
+           }
+        });
+
+        // Check if cancelled during await
+        if (controller.signal.aborted) throw new Error("Cancelled.");
+
+        // Process Result
+        const pcmData = base64ToUint8Array(base64Audio);
+        pcmChunks.push(pcmData);
         
-        // Prepare current batch
-        const batchIndices: number[] = [];
-        for (let j = 0; j < BATCH_SIZE && i + j < chunks.length; j++) {
-          batchIndices.push(i + j);
+        // Live Preview
+        if (livePreview) {
+           playChunkLive(pcmData);
         }
 
-        setProgressMessage(`Processing batch ${Math.ceil((i + 1) / BATCH_SIZE)} of ${Math.ceil(totalChunks / BATCH_SIZE)}...`);
-
-        // Create promises for the batch
-        const promises = batchIndices.map(idx => {
-          return generateSpeechFromText({
-            text: chunks[idx],
-            instruction,
-            voice: selectedVoice,
-            language: selectedLanguage
-          }, apiKey, (statusMsg) => {
-             // Only update status if it's a rate limit warning, otherwise it flickers too much in parallel
-             if (statusMsg.includes('limit') || statusMsg.includes('Cooling')) setProgressMessage(statusMsg);
-          });
-        });
-
-        // Wait for all requests in this batch to finish
-        const results = await Promise.all(promises);
-
-        // Process results in correct order to maintain audio sequence
-        results.forEach((base64Audio, localIdx) => {
-          const globalIdx = batchIndices[localIdx];
-          const pcmData = base64ToUint8Array(base64Audio);
-          pcmChunks[globalIdx] = pcmData;
-          
-          if (livePreview) {
-             playChunkLive(pcmData);
-          }
-        });
-
-        // Small breathing room between batches to be nice to the API
-        if (i + BATCH_SIZE < chunks.length) {
-          await new Promise(r => setTimeout(r, 200)); 
-        }
+        // Update Timeline
+        setProcessedChunks(i + 1);
+        setProgress(((i + 1) / chunks.length) * 100);
       }
 
-      setProgressMessage('Stitching audio...');
+      // Stitch
+      setProgressMessage('Finalizing audio...');
       const mergedPcm = mergeBuffers(pcmChunks);
       const wavBuffer = pcmToWav(mergedPcm.buffer);
       const blob = new Blob([wavBuffer], { type: 'audio/wav' });
@@ -281,15 +295,33 @@ export default function App() {
       setProgressMessage('');
 
     } catch (err: any) {
-      setError(err.message || "An unexpected error occurred.");
-      setStatus(TTSStatus.ERROR);
-      setProgressMessage('');
+      if (err.message === "Cancelled." || err.message.includes("cancelled")) {
+        setStatus(TTSStatus.IDLE);
+        setProgressMessage('');
+      } else {
+        setError(err.message || "An unexpected error occurred.");
+        setStatus(TTSStatus.ERROR);
+        setProgressMessage('');
+      }
     } finally {
-      // We don't close the audio context here immediately because the audio might still be playing from the buffer
+      setAbortController(null);
     }
   };
 
-  const isLoading = status === TTSStatus.GENERATING;
+  const handleStop = () => {
+    if (abortController) {
+      abortController.abort();
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+    setStatus(TTSStatus.IDLE);
+    setProcessedChunks(0);
+    setProgress(0);
+  };
+
+  const isGenerating = status === TTSStatus.GENERATING;
   const isRateLimit = progressMessage.toLowerCase().includes('cooling') || progressMessage.toLowerCase().includes('limit');
 
   return (
@@ -315,7 +347,7 @@ export default function App() {
                 Gemini Voice Studio
               </h1>
               <p className="text-slate-500 dark:text-slate-400 text-sm md:text-base max-w-lg">
-                Create lifelike speech with emotional intelligence.
+                Create cohesive long-form speech using Smart Context.
               </p>
             </div>
             
@@ -353,7 +385,7 @@ export default function App() {
                 <LanguageSelector 
                   selectedLanguage={selectedLanguage}
                   onSelect={setSelectedLanguage}
-                  disabled={isLoading}
+                  disabled={isGenerating}
                 />
                 <div className="h-px bg-slate-200 dark:bg-slate-800 my-6" />
 
@@ -361,13 +393,13 @@ export default function App() {
                   voices={VOICES} 
                   selectedVoice={selectedVoice} 
                   onSelect={setSelectedVoice}
-                  disabled={isLoading} 
+                  disabled={isGenerating} 
                 />
                 <div className="h-px bg-slate-200 dark:bg-slate-800 my-6" />
                 <StylePresets 
                   presets={PRESETS} 
                   onSelect={setInstruction}
-                  disabled={isLoading}
+                  disabled={isGenerating}
                 />
               </div>
               
@@ -376,9 +408,9 @@ export default function App() {
                    <Wand2 className="w-4 h-4 text-indigo-600 dark:text-indigo-300" />
                  </div>
                  <div>
-                   <h3 className="text-sm font-bold text-indigo-900 dark:text-indigo-200 mb-1">Rich Text Ready</h3>
+                   <h3 className="text-sm font-bold text-indigo-900 dark:text-indigo-200 mb-1">Smart Cohesion</h3>
                    <p className="text-xs text-indigo-700/80 dark:text-indigo-300/70 leading-relaxed">
-                     Paste your formatted text directly. We preserve the look while generating seamless audio from the content.
+                     We now process segments sequentially, passing the previous sentence as context. This ensures consistent tone and flow across long documents.
                    </p>
                  </div>
               </div>
@@ -396,7 +428,7 @@ export default function App() {
                         value={instruction}
                         onChange={(e) => setInstruction(e.target.value)}
                         placeholder="Style Direction (e.g. 'Whisper urgently...')"
-                        disabled={isLoading}
+                        disabled={isGenerating}
                         className="w-full bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-900 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 placeholder:text-slate-400 dark:placeholder:text-slate-600 transition-all shadow-sm"
                      />
                   </div>
@@ -404,7 +436,7 @@ export default function App() {
                   {/* Live Preview Toggle */}
                   <button
                     onClick={() => setLivePreview(!livePreview)}
-                    disabled={isLoading}
+                    disabled={isGenerating}
                     className={`
                        flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold border transition-all
                        ${livePreview 
@@ -417,29 +449,60 @@ export default function App() {
                     <Volume2 className={`w-3.5 h-3.5 ${livePreview ? 'animate-pulse' : ''}`} />
                     <span className="hidden sm:inline">Live Preview</span>
                   </button>
-
-                  <div className={`text-[10px] md:text-xs font-mono font-medium px-2.5 py-1.5 rounded-md border 
-                    ${text.length > MAX_CHARS 
-                      ? 'text-red-600 dark:text-red-400 border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-900/10' 
-                      : text.length > MAX_CHARS * 0.9 
-                        ? 'text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10' 
-                        : 'text-slate-500 dark:text-slate-400 border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800'}
-                  `}>
-                    {text.length.toLocaleString()} / {MAX_CHARS.toLocaleString()}
-                  </div>
                 </div>
 
                 {/* Editor */}
                 <div className="flex-1 relative min-h-0 z-10 group bg-transparent">
                   <div
                     ref={editorRef}
-                    contentEditable={!isLoading}
+                    contentEditable={!isGenerating}
                     onInput={handleInput}
                     data-placeholder="Enter or paste your text here..."
                     className="rich-text-editor w-full h-full p-6 text-base md:text-lg leading-loose text-slate-800 dark:text-slate-200 focus:outline-none custom-scrollbar"
                     suppressContentEditableWarning={true}
                   />
+                  
+                  {/* Generation Overlay / Processing State */}
+                  {isGenerating && (
+                    <div className="absolute inset-0 bg-white/50 dark:bg-slate-900/50 backdrop-blur-[2px] z-20 flex flex-col items-center justify-center pointer-events-none">
+                      {/* We leave pointer events on buttons in the overlay if we add specific controls, but here we just show status */}
+                    </div>
+                  )}
                 </div>
+
+                {/* TIMELINE / PROGRESS BAR */}
+                {isGenerating && (
+                  <div className="border-t border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/50 px-6 py-4 z-30">
+                     <div className="flex items-center justify-between mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                        <span>Timeline</span>
+                        <span>{Math.round(progress)}% Complete</span>
+                     </div>
+                     <div className="relative h-2 w-full bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
+                        <div 
+                           className="absolute top-0 left-0 h-full bg-indigo-500 transition-all duration-300 ease-out"
+                           style={{ width: `${progress}%` }}
+                        />
+                     </div>
+                     <div className="flex items-center justify-between mt-2">
+                        <span className="text-xs text-slate-600 dark:text-slate-300 font-mono">
+                           Segment {processedChunks + 1} / {totalChunksCount}
+                        </span>
+                        
+                        {/* Status Message */}
+                        <div className="flex items-center gap-2">
+                           {isRateLimit ? (
+                             <span className="text-xs text-amber-600 dark:text-amber-400 font-bold flex items-center gap-1">
+                               <Clock className="w-3 h-3" /> Cool-down
+                             </span>
+                           ) : (
+                             <span className="text-xs text-indigo-600 dark:text-indigo-400 flex items-center gap-1">
+                               <Loader2 className="w-3 h-3 animate-spin" /> Rendering
+                             </span>
+                           )}
+                        </div>
+                     </div>
+                  </div>
+                )}
 
                 {/* Error Banner */}
                 {error && (
@@ -465,95 +528,72 @@ export default function App() {
                           src={audioUrl} 
                           className="w-full h-12 block focus:outline-none" 
                         />
-                        
-                        {/* Audio Controls Toolbar */}
-                        <div className="flex flex-wrap items-center justify-between gap-4 px-4 py-3 bg-slate-50/50 dark:bg-slate-800/30 border-t border-slate-100 dark:border-slate-800">
-                          
-                          {/* Speed Controls */}
-                          <div className="flex items-center gap-3">
-                            <div className="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
-                              <Gauge className="w-4 h-4" />
-                              <span className="text-xs font-bold uppercase tracking-wider">Speed</span>
-                            </div>
-                            <div className="flex items-center bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700 p-0.5">
-                              {[0.75, 1, 1.25, 1.5, 2].map((rate) => (
-                                <button
-                                  key={rate}
-                                  onClick={() => setPlaybackRate(rate)}
-                                  className={`
-                                    px-2.5 py-1 text-xs font-medium rounded-md transition-all
-                                    ${playbackRate === rate 
-                                      ? 'bg-indigo-100 dark:bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 shadow-sm' 
-                                      : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700/50'
-                                    }
-                                  `}
-                                >
-                                  {rate}x
-                                </button>
-                              ))}
-                            </div>
-                          </div>
-
-                          {/* Download Button */}
+                        <div className="flex items-center justify-between px-4 py-2 bg-slate-50/50 dark:bg-slate-800/30 border-t border-slate-100 dark:border-slate-800">
                           <button 
                             onClick={handleDownload}
-                            className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-indigo-300 dark:hover:border-indigo-500/50 text-slate-600 dark:text-slate-300 hover:text-indigo-600 dark:hover:text-indigo-400 text-xs font-bold transition-all shadow-sm hover:shadow"
+                            className="text-xs font-bold text-slate-500 hover:text-indigo-600 flex items-center gap-1"
                           >
-                            <Download className="w-3.5 h-3.5" />
-                            <span>Download WAV</span>
+                            <Download className="w-3 h-3" /> Download
                           </button>
                         </div>
                       </div>
+                    ) : isGenerating ? (
+                      // GENERATING STATE CONTROLS
+                      <div className="w-full flex items-center justify-between px-4">
+                         <div className="flex items-center gap-3">
+                           {livePreview && (
+                              <button 
+                                onClick={togglePreviewPause}
+                                className={`
+                                  flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-bold uppercase tracking-wider transition-all
+                                  ${isPreviewPaused
+                                    ? 'bg-amber-50 dark:bg-amber-900/20 border-amber-200 text-amber-700 dark:text-amber-400'
+                                    : 'bg-indigo-50 dark:bg-indigo-900/20 border-indigo-200 text-indigo-700 dark:text-indigo-400 animate-pulse'
+                                  }
+                                `}
+                              >
+                                {isPreviewPaused ? <Play className="w-3.5 h-3.5 fill-current" /> : <Pause className="w-3.5 h-3.5 fill-current" />}
+                                <span>{isPreviewPaused ? 'Resume Preview' : 'Live Preview'}</span>
+                              </button>
+                           )}
+                           
+                           <span className="text-xs text-slate-400 dark:text-slate-500 font-mono">
+                             {isRateLimit ? progressMessage : `Processing chunk ${processedChunks + 1}...`}
+                           </span>
+                         </div>
+                         
+                         <button 
+                            onClick={handleStop}
+                            className="flex items-center gap-2 text-xs font-bold text-red-500 hover:text-red-700 px-3 py-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
+                         >
+                           <StopCircle className="w-4 h-4" />
+                           <span>Cancel</span>
+                         </button>
+                      </div>
                     ) : (
-                      <div className="w-full text-center text-sm text-slate-500 dark:text-slate-500 italic flex items-center justify-center gap-2">
-                         {isLoading ? (
-                           isRateLimit ? (
-                             <div className="flex flex-col items-center justify-center gap-2 py-2 animate-pulse">
-                               <div className="flex items-center gap-2 text-amber-600 dark:text-amber-500 font-bold">
-                                 <Clock className="w-5 h-5" />
-                                 <span>API Cool-down Active</span>
-                               </div>
-                               <p className="text-xs text-amber-600/80 dark:text-amber-400 font-mono">
-                                 {progressMessage}
-                               </p>
-                             </div>
-                           ) : (
-                             <div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400">
-                               {livePreview && <Volume2 className="w-4 h-4 animate-pulse" />}
-                               <span className="animate-pulse font-medium">{progressMessage || 'Initializing...'}</span>
-                             </div>
-                           )
-                         ) : (
-                           'Ready to generate'
-                         )}
+                      <div className="w-full text-center text-sm text-slate-500 italic">
+                        Ready to generate high-quality speech
                       </div>
                     )}
                   </div>
 
-                  {/* Generate Button */}
-                  <button
-                    onClick={handleGenerate}
-                    disabled={isLoading || !text.trim()}
-                    className={`
-                      w-full md:w-auto px-8 py-3.5 rounded-xl font-bold text-white shadow-lg flex items-center justify-center gap-2.5 transition-all transform
-                      ${isLoading || !text.trim()
-                        ? 'bg-slate-300 dark:bg-slate-700 cursor-not-allowed opacity-70 shadow-none' 
-                        : 'bg-indigo-600 hover:bg-indigo-500 dark:bg-gradient-to-r dark:from-indigo-600 dark:to-purple-600 dark:hover:from-indigo-500 dark:hover:to-purple-500 hover:scale-[1.02] active:scale-[0.98] shadow-indigo-500/20'
-                      }
-                    `}
-                  >
-                    {isLoading ? (
-                      <>
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                        <span>Processing</span>
-                      </>
-                    ) : (
-                      <>
-                        {status === TTSStatus.SUCCESS ? <RefreshCcw className="w-5 h-5" /> : <Play className="w-5 h-5 fill-current" />}
-                        <span>{status === TTSStatus.SUCCESS ? 'Regenerate' : 'Generate'}</span>
-                      </>
-                    )}
-                  </button>
+                  {/* Generate Button (Hidden when generating to show Stop/Pause instead) */}
+                  {!isGenerating && (
+                    <button
+                      onClick={handleGenerate}
+                      disabled={!text.trim()}
+                      className={`
+                        w-full md:w-auto px-8 py-3.5 rounded-xl font-bold text-white shadow-lg flex items-center justify-center gap-2.5 transition-all transform
+                        ${!text.trim()
+                          ? 'bg-slate-300 dark:bg-slate-700 cursor-not-allowed opacity-70 shadow-none' 
+                          : 'bg-indigo-600 hover:bg-indigo-500 dark:bg-gradient-to-r dark:from-indigo-600 dark:to-purple-600 dark:hover:from-indigo-500 dark:hover:to-purple-500 hover:scale-[1.02] active:scale-[0.98] shadow-indigo-500/20'
+                        }
+                      `}
+                    >
+                      {status === TTSStatus.SUCCESS ? <RefreshCcw className="w-5 h-5" /> : <Play className="w-5 h-5 fill-current" />}
+                      <span>{status === TTSStatus.SUCCESS ? 'Regenerate' : 'Generate'}</span>
+                    </button>
+                  )}
                 </div>
               </div>
             </section>

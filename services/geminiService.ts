@@ -1,7 +1,11 @@
+
 import { GoogleGenAI, Modality } from "@google/genai";
 import { GenerationConfig } from "../types";
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// The default style if none is provided
+const DEFAULT_STYLE = "Great storyteller, perfect YouTuber delivering the narratives as they land most effectively with sometimes high-pitched, low-pitched modulations, as for perfect timings";
 
 export const generateSpeechFromText = async (
   config: GenerationConfig, 
@@ -39,10 +43,33 @@ export const generateSpeechFromText = async (
     languageDirective = "Read the following text in English.";
   }
 
-  // Construct the final prompt
-  const promptText = config.instruction 
-    ? `${languageDirective}\nStyle instruction: ${config.instruction}\n\nText to speak:\n${config.text}`
-    : `${languageDirective}\n\nText to speak:\n${config.text}`;
+  // --- SMART PROMPTING LOGIC ---
+  // We construct a structured prompt that separates instructions, context, and the actual text to read.
+  let finalPrompt = `${languageDirective}\n`;
+
+  // Use user instruction if present, otherwise fallback to default YouTuber style
+  const styleInstruction = config.instruction && config.instruction.trim().length > 0 
+    ? config.instruction 
+    : DEFAULT_STYLE;
+
+  finalPrompt += `Style Instruction: ${styleInstruction}\n`;
+
+  // If we have context from the previous chunk, we add it so the AI knows the flow.
+  // Crucially, we tell it NOT to read this part.
+  if (config.previousContext) {
+    finalPrompt += `
+[CONTEXT - PREVIOUS SENTENCES]
+(Do NOT read the text below out loud. Use it only to determine the correct tone, flow, and emotion for the continuation.)
+"${config.previousContext}"
+[END CONTEXT]
+`;
+  }
+
+  finalPrompt += `
+[TEXT TO READ]
+(Read ONLY the text below out loud. Maintain the flow from the context above.)
+${config.text}
+`;
 
   let lastError: any;
   const MAX_RETRIES = 5; 
@@ -54,7 +81,7 @@ export const generateSpeechFromText = async (
       attempt++;
       const response = await ai.models.generateContent({
         model: modelName,
-        contents: [{ parts: [{ text: promptText }] }],
+        contents: [{ parts: [{ text: finalPrompt }] }],
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
@@ -103,10 +130,6 @@ export const generateSpeechFromText = async (
         }
 
         // 2. Apply "Pessimistic Buffer" Strategy
-        // If Google says 60s, waiting exactly 60s is risky. We add:
-        // - A fixed safety buffer (5 seconds)
-        // - A percentage buffer (10% of total) to scale with longer waits
-        // - A random jitter (0-2s) to prevent synchronized retries
         const safetyPadding = 5000; 
         const percentagePadding = baseWaitTime * 0.10; 
         const jitter = Math.random() * 2000;
@@ -114,7 +137,6 @@ export const generateSpeechFromText = async (
         let totalWaitTime = Math.ceil(baseWaitTime + safetyPadding + percentagePadding + jitter);
 
         // 3. Exponential Penalty for stubborn errors
-        // If we just waited and failed AGAIN, double the wait time.
         if (consecutiveRateLimitHits > 1) {
           totalWaitTime = totalWaitTime * 2;
         }
@@ -123,7 +145,6 @@ export const generateSpeechFromText = async (
         const totalSeconds = Math.ceil(totalWaitTime / 1000);
         for (let i = totalSeconds; i > 0; i--) {
            if (onStatusUpdate) {
-             // If this is a repeat offense, let the user know we are adding extra time
              const extraContext = consecutiveRateLimitHits > 1 ? " (Extended wait due to retry failure)" : "";
              onStatusUpdate(`Rate limit hit. Cooling down: ${i}s${extraContext}...`);
            }
@@ -131,9 +152,7 @@ export const generateSpeechFromText = async (
         }
         
         // 5. Visual "Verifying" Phase
-        // Instead of silently retrying, we explicitly tell the user we are checking.
         if (onStatusUpdate) onStatusUpdate("Verifying server availability...");
-        // Pause here so the user actually reads the message and sees the state change
         await delay(2000);
 
         continue; 
@@ -142,7 +161,7 @@ export const generateSpeechFromText = async (
       // --- STANDARD ERROR HANDLING ---
       console.warn(`TTS generation attempt ${attempt} failed:`, error);
 
-      // Don't retry client errors (Bad Request, Forbidden, Not Found)
+      // Don't retry client errors
       if (error.status === 400 || error.status === 403 || (error.message && (error.message.includes("400") || error.message.includes("403") || error.message.includes("404")))) {
         break;
       }

@@ -1,3 +1,4 @@
+
 export interface VoiceOption {
   name: string;
   gender: 'Male' | 'Female';
@@ -15,11 +16,13 @@ export interface GenerationConfig {
   instruction: string;
   voice: string;
   language: string;
+  previousContext?: string; // New field for smart cohesion
 }
 
 export enum TTSStatus {
   IDLE = 'IDLE',
   GENERATING = 'GENERATING',
+  PAUSED = 'PAUSED', // New status
   SUCCESS = 'SUCCESS',
   ERROR = 'ERROR'
 }
