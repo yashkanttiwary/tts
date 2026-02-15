@@ -1,6 +1,6 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle } from 'lucide-react';
+import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus } from './types';
 import { generateSpeechFromText } from './services/geminiService';
 import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
@@ -58,6 +58,9 @@ export default function App() {
   
   // API Key State
   const [apiKey, setApiKey] = useState('');
+  // We use a ref for the API key so the running async loop can access the LATEST value
+  // even if the user updates it while the loop is running (hot-swap)
+  const apiKeyRef = useRef('');
   const [isApiModalOpen, setIsApiModalOpen] = useState(false);
 
   // Content State
@@ -74,10 +77,12 @@ export default function App() {
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
 
-  // Timeline State
+  // Timeline & Buffer State
   const [progress, setProgress] = useState(0); // 0-100
   const [processedChunks, setProcessedChunks] = useState(0);
   const [totalChunksCount, setTotalChunksCount] = useState(0);
+  // Ref to hold PCM chunks for immediate partial download without re-rendering
+  const pcmChunksRef = useRef<Uint8Array[]>([]);
 
   // Playback State
   const [playbackRate, setPlaybackRate] = useState(1.0);
@@ -94,7 +99,10 @@ export default function App() {
   // Load API key from local storage on mount
   useEffect(() => {
     const storedKey = localStorage.getItem('gemini_api_key');
-    if (storedKey) setApiKey(storedKey);
+    if (storedKey) {
+      setApiKey(storedKey);
+      apiKeyRef.current = storedKey;
+    }
   }, []);
 
   useEffect(() => {
@@ -106,11 +114,8 @@ export default function App() {
     };
   }, [audioUrl]);
 
-  // Handle playback rate updates for live preview
+  // Handle playback rate updates
   useEffect(() => {
-     // NOTE: Web Audio API playbackRate is harder to change dynamically on already scheduled nodes 
-     // without keeping track of every source node. 
-     // For this version, playbackRate primarily affects the final audio element.
      if (audioRef.current) {
        audioRef.current.playbackRate = playbackRate;
      }
@@ -131,11 +136,13 @@ export default function App() {
 
   const handleSaveApiKey = (key: string) => {
     setApiKey(key);
+    apiKeyRef.current = key; // Update Ref for hot-swap
     localStorage.setItem('gemini_api_key', key);
   };
 
   const handleDisconnectApiKey = () => {
     setApiKey('');
+    apiKeyRef.current = '';
     localStorage.removeItem('gemini_api_key');
   };
 
@@ -147,6 +154,26 @@ export default function App() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const handleDownloadPartial = () => {
+    if (pcmChunksRef.current.length === 0) return;
+    try {
+      const mergedPcm = mergeBuffers(pcmChunksRef.current);
+      const wavBuffer = pcmToWav(mergedPcm.buffer);
+      const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+      const url = URL.createObjectURL(blob);
+      
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `gemini-speech-partial-${processedChunks}-chunks.wav`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error("Failed to download partial audio", e);
+    }
   };
 
   // --- LIVE PREVIEW LOGIC ---
@@ -210,7 +237,8 @@ export default function App() {
       }
     } catch (e) {}
 
-    if (!apiKey && !envKey) {
+    // Check if we have a key (either in state, ref, or env)
+    if (!apiKey && !apiKeyRef.current && !envKey) {
       setIsApiModalOpen(true);
       return;
     }
@@ -223,6 +251,7 @@ export default function App() {
     setError('');
     setProgress(0);
     setProcessedChunks(0);
+    pcmChunksRef.current = []; // Clear previous buffer
     if (audioUrl) URL.revokeObjectURL(audioUrl);
     setAudioUrl(null);
 
@@ -235,7 +264,6 @@ export default function App() {
 
     try {
       const chunks = splitTextIdeally(currentText, CHUNK_SIZE);
-      const pcmChunks: Uint8Array[] = [];
       setTotalChunksCount(chunks.length);
 
       // --- SEQUENTIAL PROCESSING ---
@@ -249,17 +277,18 @@ export default function App() {
         setProgressMessage(`Rendering segment ${i + 1} of ${chunks.length}`);
 
         // SMART PROMPTING: Get context from previous chunk (if exists)
-        // We take the last ~200 characters of the previous chunk to give the AI a clue about flow
         const previousContext = i > 0 ? chunks[i-1].slice(-200) : undefined;
 
         // Generate
+        // CRITICAL: We pass a FUNCTION returning the key. This allows the service 
+        // to get the new key if the user updates it during a rate-limit wait loop.
         const base64Audio = await generateSpeechFromText({
           text: chunks[i],
           instruction,
           voice: selectedVoice,
           language: selectedLanguage,
           previousContext: previousContext,
-        }, apiKey, (statusMsg) => {
+        }, () => apiKeyRef.current, (statusMsg) => {
            // Only show rate limit messages in the UI, otherwise keep the "Rendering segment X" message
            if (statusMsg.includes('limit') || statusMsg.includes('Cooling') || statusMsg.includes('Verifying')) {
              setProgressMessage(statusMsg);
@@ -271,7 +300,9 @@ export default function App() {
 
         // Process Result
         const pcmData = base64ToUint8Array(base64Audio);
-        pcmChunks.push(pcmData);
+        
+        // Store in Ref for partial download and final stitch
+        pcmChunksRef.current.push(pcmData);
         
         // Live Preview
         if (livePreview) {
@@ -285,7 +316,7 @@ export default function App() {
 
       // Stitch
       setProgressMessage('Finalizing audio...');
-      const mergedPcm = mergeBuffers(pcmChunks);
+      const mergedPcm = mergeBuffers(pcmChunksRef.current);
       const wavBuffer = pcmToWav(mergedPcm.buffer);
       const blob = new Blob([wavBuffer], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
@@ -317,8 +348,9 @@ export default function App() {
       audioContextRef.current = null;
     }
     setStatus(TTSStatus.IDLE);
-    setProcessedChunks(0);
-    setProgress(0);
+    // Do NOT clear processedChunks or chunksRef here immediately 
+    // so user can see what they stopped at, but we reset status.
+    setProgressMessage('Stopped by user.');
   };
 
   const isGenerating = status === TTSStatus.GENERATING;
@@ -360,10 +392,11 @@ export default function App() {
                     ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300 hover:bg-green-100 dark:hover:bg-green-900/40' 
                     : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:border-indigo-300 dark:hover:border-slate-600'
                   }
+                  ${isGenerating && isRateLimit ? 'animate-pulse ring-2 ring-amber-400 border-amber-400' : ''}
                 `}
               >
                 {apiKey ? <Check className="w-4 h-4" /> : <Key className="w-4 h-4" />}
-                <span>{apiKey ? 'API Connected' : 'Connect API'}</span>
+                <span>{apiKey ? (isRateLimit ? 'Change Key (Hot Swap)' : 'API Connected') : 'Connect API'}</span>
               </button>
 
               <button
@@ -533,7 +566,7 @@ export default function App() {
                             onClick={handleDownload}
                             className="text-xs font-bold text-slate-500 hover:text-indigo-600 flex items-center gap-1"
                           >
-                            <Download className="w-3 h-3" /> Download
+                            <Download className="w-3 h-3" /> Download Full Audio
                           </button>
                         </div>
                       </div>
@@ -557,9 +590,16 @@ export default function App() {
                               </button>
                            )}
                            
-                           <span className="text-xs text-slate-400 dark:text-slate-500 font-mono">
-                             {isRateLimit ? progressMessage : `Processing chunk ${processedChunks + 1}...`}
-                           </span>
+                           {processedChunks > 0 && (
+                             <button
+                               onClick={handleDownloadPartial}
+                               className="flex items-center gap-2 px-3 py-1.5 rounded-lg border bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300 text-xs font-bold uppercase tracking-wider hover:bg-green-100 transition-all"
+                               title="Download what has been generated so far"
+                             >
+                               <Save className="w-3.5 h-3.5" />
+                               <span>Save So Far</span>
+                             </button>
+                           )}
                          </div>
                          
                          <button 

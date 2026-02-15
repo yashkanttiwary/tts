@@ -7,29 +7,36 @@ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // The default style if none is provided
 const DEFAULT_STYLE = "Great storyteller, perfect YouTuber delivering the narratives as they land most effectively with sometimes high-pitched, low-pitched modulations, as for perfect timings";
 
+// Helper to get key from string or function
+const resolveKey = (keyOrProvider: string | (() => string)): string => {
+  if (typeof keyOrProvider === 'function') {
+    return keyOrProvider();
+  }
+  return keyOrProvider;
+};
+
 export const generateSpeechFromText = async (
   config: GenerationConfig, 
-  apiKey?: string,
+  apiKeyOrProvider: string | (() => string),
   onStatusUpdate?: (msg: string) => void
 ): Promise<string> => {
-  // Prioritize user-provided key, fallback to env var (safely checked for browser)
-  let envKey = '';
+  
+  // Initial check
+  let currentKey = resolveKey(apiKeyOrProvider);
+
+  // Fallback to env if not provided
   try {
-    if (typeof process !== 'undefined' && process.env && process.env.API_KEY) {
-      envKey = process.env.API_KEY;
+    if (!currentKey && typeof process !== 'undefined' && process.env && process.env.API_KEY) {
+      currentKey = process.env.API_KEY;
     }
   } catch (e) {
-    // Ignore process errors in browser
+    // Ignore process errors
+  }
+  
+  if (!currentKey) {
+    throw new Error("API Key is missing. Please click the 'Connect API' button to configure it.");
   }
 
-  const keyToUse = apiKey || envKey;
-  
-  if (!keyToUse) {
-    throw new Error("API Key is missing. Please click the 'Connect API' button in the top right to configure it.");
-  }
-
-  const ai = new GoogleGenAI({ apiKey: keyToUse });
-  
   // Reverted to Flash TTS model for speed and higher rate limits
   const modelName = "gemini-2.5-flash-preview-tts";
 
@@ -44,18 +51,14 @@ export const generateSpeechFromText = async (
   }
 
   // --- SMART PROMPTING LOGIC ---
-  // We construct a structured prompt that separates instructions, context, and the actual text to read.
   let finalPrompt = `${languageDirective}\n`;
 
-  // Use user instruction if present, otherwise fallback to default YouTuber style
   const styleInstruction = config.instruction && config.instruction.trim().length > 0 
     ? config.instruction 
     : DEFAULT_STYLE;
 
   finalPrompt += `Style Instruction: ${styleInstruction}\n`;
 
-  // If we have context from the previous chunk, we add it so the AI knows the flow.
-  // Crucially, we tell it NOT to read this part.
   if (config.previousContext) {
     finalPrompt += `
 [CONTEXT - PREVIOUS SENTENCES]
@@ -78,6 +81,13 @@ ${config.text}
 
   while (true) {
     try {
+      // DYNAMIC KEY RE-FETCH:
+      // We fetch the key *inside* the loop. If the user changed the key in the UI
+      // while we were waiting in the 'catch' block below, this will pick up the NEW key.
+      currentKey = resolveKey(apiKeyOrProvider);
+      
+      const ai = new GoogleGenAI({ apiKey: currentKey });
+
       attempt++;
       const response = await ai.models.generateContent({
         model: modelName,
@@ -136,7 +146,7 @@ ${config.text}
 
         let totalWaitTime = Math.ceil(baseWaitTime + safetyPadding + percentagePadding + jitter);
 
-        // 3. Exponential Penalty for stubborn errors
+        // 3. Exponential Penalty
         if (consecutiveRateLimitHits > 1) {
           totalWaitTime = totalWaitTime * 2;
         }
@@ -145,14 +155,14 @@ ${config.text}
         const totalSeconds = Math.ceil(totalWaitTime / 1000);
         for (let i = totalSeconds; i > 0; i--) {
            if (onStatusUpdate) {
-             const extraContext = consecutiveRateLimitHits > 1 ? " (Extended wait due to retry failure)" : "";
-             onStatusUpdate(`Rate limit hit. Cooling down: ${i}s${extraContext}...`);
+             const extraContext = consecutiveRateLimitHits > 1 ? " (Extended wait)" : "";
+             onStatusUpdate(`Rate limit hit. Cooling down: ${i}s${extraContext}... (You can change API Key now)`);
            }
            await delay(1000);
         }
         
         // 5. Visual "Verifying" Phase
-        if (onStatusUpdate) onStatusUpdate("Verifying server availability...");
+        if (onStatusUpdate) onStatusUpdate("Verifying server availability (checking new key if changed)...");
         await delay(2000);
 
         continue; 
