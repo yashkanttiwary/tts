@@ -106,9 +106,13 @@ export default function App() {
   useEffect(() => {
     const storedKeys = localStorage.getItem('gemini_api_keys');
     if (storedKeys) {
-      const parsed = JSON.parse(storedKeys);
-      setApiKeys(parsed);
-      apiKeysRef.current = parsed;
+      try {
+        const parsed = JSON.parse(storedKeys);
+        if (Array.isArray(parsed)) {
+          setApiKeys(parsed);
+          apiKeysRef.current = parsed;
+        }
+      } catch (e) { console.error("Error loading keys", e); }
     }
   }, []);
 
@@ -211,7 +215,9 @@ export default function App() {
      const statuses = keys.map(k => getKeyStatus(k, now));
 
      statuses.sort((a, b) => {
+       // 1. Sort by wait time (ascending) - Free keys first
        if (a.waitTime !== b.waitTime) return a.waitTime - b.waitTime;
+       // 2. Sort by usage count (ascending) - Load balancing
        return a.count - b.count;
      });
      
@@ -234,12 +240,14 @@ export default function App() {
     const needed = MAX_RPM_PER_KEY - requestHistoryRef.current[currentKey].length;
     
     // Add enough fake timestamps to max it out + 1 to be safe
+    // This effectively "bans" the key for 1 minute
     for (let i = 0; i <= needed + 1; i++) {
         requestHistoryRef.current[currentKey].push(now);
     }
     
-    setProgressMessage(`Skipping current key (Key ${apiKeysRef.current.indexOf(currentKey) + 1})...`);
-    // The loop in handleGenerate will pick this up on next iteration or wait cycle
+    setProgressMessage(`Skipping Key ${apiKeysRef.current.indexOf(currentKey) + 1}... switching...`);
+    // Note: The service will automatically pick the NEW best key on its next internal retry or chunk
+    // because we supply a provider function (getBestKey) instead of a static key.
   };
 
   // --- LIVE PREVIEW LOGIC ---
@@ -316,60 +324,73 @@ export default function App() {
       const chunks = splitTextIdeally(currentText, CHUNK_SIZE);
       setTotalChunksCount(chunks.length);
 
+      // --- KEY PROVIDER FUNCTION ---
+      // This is the Magic Fix. Instead of passing a static key, we pass a function.
+      // The service calls this function EVERY time it tries (or retries) to make a request.
+      // This allows 'handleSkipKey' to work instantly because the very next retry will
+      // call this, get the NEW best key, and use it.
+      const dynamicKeyProvider = () => {
+        const best = getBestKey();
+        if (!best) throw new Error("No keys available");
+        
+        // Update UI state synchronously for user feedback
+        // (Note: setState inside a loop/callback is fine, React batches or handles it)
+        const idx = apiKeysRef.current.indexOf(best.key);
+        if (idx !== -1) {
+          // We only update if it changed to avoid flicker
+          if (activeKeyRef.current !== best.key) {
+             activeKeyRef.current = best.key;
+             setActiveKeyIndex(idx + 1);
+          }
+        }
+        
+        // Record usage here because we are about to use it
+        recordKeyUsage(best.key);
+        
+        return best.key;
+      };
+
       for (let i = 0; i < chunks.length; i++) {
         if (controller.signal.aborted) throw new Error("Generation cancelled.");
 
-        // SMART KEY SELECTION
-        const bestKeyData = getBestKey();
+        // Initial check before starting the chunk (just for waiting logic)
+        // We do this to provide a nice "Cooling down" UI if ALL keys are busy.
+        // The actual key used is determined by the provider passed to generateSpeechFromText.
+        let bestKeyData = getBestKey();
         if (!bestKeyData) throw new Error("No API keys available.");
         
-        const { key: currentKey, waitTime } = bestKeyData;
-
-        // Update active key tracking
-        activeKeyRef.current = currentKey;
-        const currentKeyIndex = apiKeysRef.current.indexOf(currentKey);
-        setActiveKeyIndex(currentKeyIndex !== -1 ? currentKeyIndex + 1 : null);
-
-        // Wait if needed
-        if (waitTime > 0) {
-           const seconds = Math.ceil(waitTime / 1000);
+        // If the BEST key has a wait time, it means ALL keys are busy (since we sort by waitTime).
+        if (bestKeyData.waitTime > 0) {
+           const seconds = Math.ceil(bestKeyData.waitTime / 1000);
            for (let w = seconds; w > 0; w--) {
              if (controller.signal.aborted) throw new Error("Cancelled.");
              
-             setProgressMessage(`Cooling down: ${w}s... (Key ${currentKeyIndex + 1} Limit)`);
-             await new Promise(r => setTimeout(r, 1000));
-             
-             // Check if a better key became available (or user skipped current one)
+             // Check if a better key appeared (user added one, or user skipped and we cycled to a fresh one?)
+             // Actually if user skips, the current key waitTime goes UP, so we might switch to another key which might be free.
              const freshCheck = getBestKey();
-             if (freshCheck && freshCheck.key !== currentKey && freshCheck.waitTime === 0) {
-                 break; // Switch to new key
+             if (freshCheck && freshCheck.waitTime === 0) {
+                 break; // Found a free key, stop waiting!
              }
+
+             // Show which key is causing the hold up (the one with shortest wait)
+             const holdUpIndex = apiKeysRef.current.indexOf(bestKeyData.key) + 1;
+             setProgressMessage(`All keys busy. Cooling down: ${w}s... (Waiting on Key ${holdUpIndex})`);
+             await new Promise(r => setTimeout(r, 1000));
            }
         }
         
-        // Re-fetch best key after wait/skip
-        const finalKeyData = getBestKey();
-        if (!finalKeyData) throw new Error("Keys removed during generation.");
-        const finalKey = finalKeyData.key;
-
-        // Update tracker again if switched
-        activeKeyRef.current = finalKey;
-        const finalKeyIndex = apiKeysRef.current.indexOf(finalKey);
-        setActiveKeyIndex(finalKeyIndex !== -1 ? finalKeyIndex + 1 : null);
-
-        recordKeyUsage(finalKey);
-
         setProgressMessage(`Rendering segment ${i + 1} of ${chunks.length}`);
 
         const previousContext = i > 0 ? chunks[i-1].slice(-200) : undefined;
 
+        // We pass the PROVIDER, not the key string.
         const base64Audio = await generateSpeechFromText({
           text: chunks[i],
           instruction,
           voice: selectedVoice,
           language: selectedLanguage,
           previousContext: previousContext,
-        }, finalKey, (statusMsg) => {
+        }, dynamicKeyProvider, (statusMsg) => {
            if (statusMsg.includes('limit') || statusMsg.includes('Cooling') || statusMsg.includes('Verifying')) {
              setProgressMessage(statusMsg);
            }
@@ -585,7 +606,7 @@ export default function App() {
                         <div className="flex items-center gap-2">
                            <span>Progress</span>
                            {activeKeyIndex !== null && (
-                             <span className="px-1.5 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 text-[10px]">
+                             <span className="px-1.5 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 text-[10px] animate-in fade-in">
                                Using Key {activeKeyIndex}
                              </span>
                            )}
@@ -618,7 +639,8 @@ export default function App() {
                            {keyCount > 1 && (
                              <button
                                onClick={handleSkipKey}
-                               className="px-2 py-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded text-[10px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300 hover:border-amber-300 hover:text-amber-600 transition-all flex items-center gap-1 pointer-events-auto"
+                               className="px-2 py-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded text-[10px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300 hover:border-amber-300 hover:text-amber-600 transition-all flex items-center gap-1 pointer-events-auto shadow-sm"
+                               title="Force switch to another API key"
                              >
                                <FastForward className="w-3 h-3" /> Skip Key
                              </button>
