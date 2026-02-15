@@ -251,6 +251,76 @@ export default function App() {
     // it will immediately return a different key, causing the service to break its wait loop.
   };
 
+  // --- PREVIEW LOGIC (NEW) ---
+  const handleVoicePreview = async (voiceName: string): Promise<string> => {
+    // 1. Check LocalStorage Cache
+    const cacheKey = `preview_sample_${voiceName}`;
+    const cachedBase64 = localStorage.getItem(cacheKey);
+    
+    if (cachedBase64) {
+      // Convert cached base64 WAV to blob URL
+      const byteCharacters = atob(cachedBase64);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      }
+      const byteArray = new Uint8Array(byteNumbers);
+      const blob = new Blob([byteArray], { type: 'audio/wav' });
+      return URL.createObjectURL(blob);
+    }
+
+    // 2. If not cached, we need an API key
+    if (apiKeysRef.current.length === 0) {
+      setIsApiModalOpen(true);
+      throw new Error("Please connect an API key to generate samples.");
+    }
+
+    // 3. Generate Sample
+    // We create a specific text for each voice to show off its personality
+    const voiceData = VOICES.find(v => v.name === voiceName);
+    const sampleText = `Hello! I am ${voiceName}. I have a ${voiceData?.style.toLowerCase()} voice.`;
+    
+    const keyData = getBestKey();
+    if (!keyData || keyData.waitTime > 0) {
+      // For previews, we are less strict about waiting, but still good to check
+      // If all keys are busy, we just grab the first one and hope for the best, 
+      // or throw error. Let's try to use the best key.
+    }
+    const keyToUse = keyData ? keyData.key : apiKeysRef.current[0];
+    recordKeyUsage(keyToUse);
+
+    const base64Audio = await generateSpeechFromText({
+      text: sampleText,
+      instruction: "Speak naturally and clearly.",
+      voice: voiceName,
+      language: 'en'
+    }, keyToUse);
+
+    // 4. Convert PCM to WAV for playback
+    const pcmData = base64ToUint8Array(base64Audio);
+    const wavBuffer = pcmToWav(pcmData.buffer);
+    
+    // 5. Cache the WAV file as Base64 (so we can store in localStorage)
+    // We do this manually to save space (WAV is slightly larger than raw PCM but safer for playback)
+    const wavUint8 = new Uint8Array(wavBuffer);
+    let binary = '';
+    const len = wavUint8.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(wavUint8[i]);
+    }
+    const wavBase64 = btoa(binary);
+    
+    try {
+      localStorage.setItem(cacheKey, wavBase64);
+    } catch (e) {
+      console.warn("LocalStorage full, could not cache sample.");
+    }
+
+    // 6. Return Blob URL
+    const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+    return URL.createObjectURL(blob);
+  };
+
   // --- LIVE PREVIEW LOGIC ---
   const initAudioContext = () => {
     if (!livePreview) return;
@@ -516,6 +586,7 @@ export default function App() {
                   selectedVoice={selectedVoice} 
                   onSelect={setSelectedVoice}
                   disabled={isGenerating} 
+                  onPlayPreview={handleVoicePreview}
                 />
                 <div className="h-px bg-slate-200 dark:bg-slate-800 my-6" />
                 <StylePresets 
