@@ -1,20 +1,19 @@
 
-import React, { useState, useRef, useEffect } from 'react';
-import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save, Layers, Zap, FastForward } from 'lucide-react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save, Layers, Zap, FastForward, Settings } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus } from './types';
 import { generateSpeechFromText } from './services/geminiService';
-import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
 import VoiceSelector from './components/VoiceSelector';
 import StylePresets from './components/StylePresets';
 import LanguageSelector from './components/LanguageSelector';
 import ApiKeyModal from './components/ApiKeyModal';
+import SettingsModal from './components/SettingsModal';
+import AudioVisualizer from './components/AudioVisualizer';
+import { WORKER_CODE } from './workers/workerBlob';
 
 // STRATEGY 1: Increase Chunk Size to reduce request frequency
 const MAX_CHARS = 500000;
 const CHUNK_SIZE = 3000; 
-
-// STRATEGY 4: Hardcoded Request Limit
-const MAX_RPM_PER_KEY = 9; 
 const RATE_WINDOW_MS = 60000; // 1 Minute
 
 const VOICES: VoiceOption[] = [
@@ -33,29 +32,20 @@ const PRESETS: PresetOption[] = [
   { label: 'Whisper', prompt: 'Whisper this very quietly, intimately, and secretively:' },
 ];
 
-function splitTextIdeally(text: string, maxLength: number): string[] {
-  if (text.length <= maxLength) return [text];
-  const chunks: string[] = [];
-  let currentText = text;
-  while (currentText.length > 0) {
-    if (currentText.length <= maxLength) {
-      chunks.push(currentText);
-      break;
-    }
-    let splitIndex = -1;
-    const sentenceEndings = ['. ', '! ', '? ', '.\n', '!\n', '?\n', '." ', '!" ', '?" '];
-    for (let i = maxLength; i > maxLength * 0.8; i--) {
-        const char = currentText[i];
-        if (char === '\n' && currentText[i-1] === '\n') { splitIndex = i; break; }
-        if (sentenceEndings.some(end => currentText.substring(i - 1, i + end.length - 1) === end)) { splitIndex = i + 1; break; }
-    }
-    if (splitIndex === -1) splitIndex = currentText.lastIndexOf(' ', maxLength);
-    if (splitIndex === -1) splitIndex = maxLength;
-    chunks.push(currentText.substring(0, splitIndex).trim());
-    currentText = currentText.substring(splitIndex).trim();
-  }
-  return chunks;
-}
+// Helper to convert pcm to wav for Preview only (kept small/lightweight for single samples)
+const pcmToWavLight = (pcmData: Uint8Array): ArrayBuffer => {
+   const headerLength = 44;
+   const buffer = new ArrayBuffer(headerLength + pcmData.length);
+   const view = new DataView(buffer);
+   const sampleRate = 24000;
+   const writeStr = (v: DataView, o: number, s: string) => { for(let i=0;i<s.length;i++) v.setUint8(o+i, s.charCodeAt(i)); };
+   writeStr(view, 0, 'RIFF'); view.setUint32(4, 36 + pcmData.length, true); writeStr(view, 8, 'WAVE');
+   writeStr(view, 12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+   view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true);
+   view.setUint16(34, 16, true); writeStr(view, 36, 'data'); view.setUint32(40, pcmData.length, true);
+   new Uint8Array(buffer, 44).set(pcmData);
+   return buffer;
+};
 
 export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -64,6 +54,10 @@ export default function App() {
   const [apiKeys, setApiKeys] = useState<string[]>([]);
   const apiKeysRef = useRef<string[]>([]);
   const [isApiModalOpen, setIsApiModalOpen] = useState(false);
+
+  // Settings State
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [rpmLimit, setRpmLimit] = useState(9); // Default RPM
 
   // Rate Limiting History Ref
   const requestHistoryRef = useRef<Record<string, number[]>>({});
@@ -97,10 +91,15 @@ export default function App() {
   const [livePreview, setLivePreview] = useState(true);
   const [isPreviewPaused, setIsPreviewPaused] = useState(false);
   
+  // Refs
   const audioRef = useRef<HTMLAudioElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextAudioStartTimeRef = useRef<number>(0);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  
+  // Worker Ref
+  const workerRef = useRef<Worker | null>(null);
 
   // Load API keys
   useEffect(() => {
@@ -114,6 +113,18 @@ export default function App() {
         }
       } catch (e) { console.error("Error loading keys", e); }
     }
+  }, []);
+
+  // Initialize Worker from Blob to avoid URL/Path resolution issues
+  useEffect(() => {
+    const blob = new Blob([WORKER_CODE], { type: 'application/javascript' });
+    const blobUrl = URL.createObjectURL(blob);
+    workerRef.current = new Worker(blobUrl);
+    
+    return () => {
+      workerRef.current?.terminate();
+      URL.revokeObjectURL(blobUrl);
+    };
   }, []);
 
   useEffect(() => {
@@ -156,21 +167,53 @@ export default function App() {
     localStorage.removeItem('gemini_api_keys');
   };
 
-  const handleDownload = () => {
-    if (!audioUrl) return;
-    const link = document.createElement('a');
-    link.href = audioUrl;
-    link.download = `gemini-speech-${Date.now()}.wav`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+  const workerRpc = useCallback((type: string, payload: any, transfer?: Transferable[]): Promise<any> => {
+    return new Promise((resolve, reject) => {
+      if (!workerRef.current) return reject(new Error("Worker not initialized"));
+      
+      const id = Math.random().toString(36).substr(2, 9);
+      
+      const handler = (e: MessageEvent) => {
+        if (e.data.id === id) {
+          workerRef.current?.removeEventListener('message', handler);
+          if (e.data.type === 'ERROR') {
+            reject(new Error(e.data.payload));
+          } else {
+            resolve(e.data.payload);
+          }
+        }
+      };
+      
+      workerRef.current.addEventListener('message', handler);
+      workerRef.current.postMessage({ type, payload, id }, transfer || []);
+    });
+  }, []);
+
+  const handleDownload = async () => {
+    if (!audioUrl && pcmChunksRef.current.length === 0) return;
+    
+    // Use URL if already generated
+    if (audioUrl && status === TTSStatus.SUCCESS) {
+      const link = document.createElement('a');
+      link.href = audioUrl;
+      link.download = `gemini-speech-${Date.now()}.wav`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      return;
+    }
+    
+    // Or generate on the fly
+    await handleDownloadPartial();
   };
 
-  const handleDownloadPartial = () => {
+  const handleDownloadPartial = async () => {
     if (pcmChunksRef.current.length === 0) return;
     try {
-      const mergedPcm = mergeBuffers(pcmChunksRef.current);
-      const wavBuffer = pcmToWav(mergedPcm.buffer);
+      setProgressMessage('Preparing download...');
+      // Offload WAV creation to worker
+      const wavBuffer = await workerRpc('EXPORT_WAV', { chunks: pcmChunksRef.current });
+      
       const blob = new Blob([wavBuffer], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -180,8 +223,10 @@ export default function App() {
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
+      setProgressMessage('');
     } catch (e) {
-      console.error("Failed to download partial audio", e);
+      console.error("Failed to download audio", e);
+      setError("Failed to generate WAV file.");
     }
   };
 
@@ -191,14 +236,14 @@ export default function App() {
     if (!requestHistoryRef.current[key]) {
       requestHistoryRef.current[key] = [];
     }
-    // Clean up old timestamps
     requestHistoryRef.current[key] = requestHistoryRef.current[key].filter(
       timestamp => now - timestamp < RATE_WINDOW_MS
     );
     const history = requestHistoryRef.current[key];
     const count = history.length;
     let waitTime = 0;
-    if (count >= MAX_RPM_PER_KEY) {
+    
+    if (count >= rpmLimit) {
       const oldestRequestTime = history[0];
       const timeSinceOldest = now - oldestRequestTime;
       const needed = RATE_WINDOW_MS - timeSinceOldest + 1000;
@@ -215,9 +260,7 @@ export default function App() {
      const statuses = keys.map(k => getKeyStatus(k, now));
 
      statuses.sort((a, b) => {
-       // 1. Sort by wait time (ascending) - Free keys first
        if (a.waitTime !== b.waitTime) return a.waitTime - b.waitTime;
-       // 2. Sort by usage count (ascending) - Load balancing
        return a.count - b.count;
      });
      
@@ -233,34 +276,28 @@ export default function App() {
     const currentKey = activeKeyRef.current;
     if (!currentKey) return;
 
-    // To aggressively ban this key, we clear its history and fill it with CURRENT timestamps.
-    // This forces 'oldestRequestTime' to be NOW.
-    // Result: waitTime = 60s - (now - now) = 60s.
-    // This pushes it to the absolute bottom of the priority queue.
     const now = Date.now();
-    requestHistoryRef.current[currentKey] = []; // Clear old history
-    for (let i = 0; i < MAX_RPM_PER_KEY + 1; i++) {
+    requestHistoryRef.current[currentKey] = []; 
+    for (let i = 0; i < rpmLimit + 1; i++) {
         requestHistoryRef.current[currentKey].push(now);
     }
     
     setProgressMessage(`Skipping Key ${apiKeysRef.current.indexOf(currentKey) + 1}... switching...`);
-    // Note: The service loop (or the wait loop below) polls 'getBestKey'.
-    // Since we just maxed out the waitTime for 'currentKey', 'getBestKey' will immediately return a different key.
   };
 
-  // --- PREVIEW LOGIC (NEW) ---
+  // --- PREVIEW LOGIC (Simple) ---
   const handleVoicePreview = async (voiceName: string): Promise<string> => {
     const cacheKey = `preview_sample_${voiceName}`;
     const cachedBase64 = localStorage.getItem(cacheKey);
     
     if (cachedBase64) {
-      const byteCharacters = atob(cachedBase64);
-      const byteNumbers = new Array(byteCharacters.length);
-      for (let i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      const binaryString = atob(cachedBase64);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
       }
-      const byteArray = new Uint8Array(byteNumbers);
-      const blob = new Blob([byteArray], { type: 'audio/wav' });
+      const blob = new Blob([bytes], { type: 'audio/wav' });
       return URL.createObjectURL(blob);
     }
 
@@ -283,21 +320,25 @@ export default function App() {
       language: 'en'
     }, keyToUse);
 
-    const pcmData = base64ToUint8Array(base64Audio);
-    const wavBuffer = pcmToWav(pcmData.buffer);
+    const binaryString = atob(base64Audio);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    const wavBuffer = pcmToWavLight(bytes);
+    
     const wavUint8 = new Uint8Array(wavBuffer);
     let binary = '';
-    const len = wavUint8.byteLength;
-    for (let i = 0; i < len; i++) {
+    const wavLen = wavUint8.byteLength;
+    for (let i = 0; i < wavLen; i++) {
       binary += String.fromCharCode(wavUint8[i]);
     }
     const wavBase64 = btoa(binary);
     
     try {
       localStorage.setItem(cacheKey, wavBase64);
-    } catch (e) {
-      console.warn("LocalStorage full, could not cache sample.");
-    }
+    } catch (e) { console.warn("LocalStorage full"); }
 
     const blob = new Blob([wavBuffer], { type: 'audio/wav' });
     return URL.createObjectURL(blob);
@@ -310,6 +351,12 @@ export default function App() {
       if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
         const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
         audioContextRef.current = new AudioContextClass();
+        
+        analyserRef.current = audioContextRef.current.createAnalyser();
+        analyserRef.current.smoothingTimeConstant = 0.8;
+        analyserRef.current.fftSize = 256;
+        analyserRef.current.connect(audioContextRef.current.destination);
+
         nextAudioStartTimeRef.current = audioContextRef.current.currentTime;
       } else if (audioContextRef.current.state === 'suspended') {
         audioContextRef.current.resume();
@@ -320,16 +367,17 @@ export default function App() {
     }
   };
 
-  const playChunkLive = (pcmData: Uint8Array) => {
-    if (!audioContextRef.current || !livePreview) return;
+  const playChunkLive = async (float32Data: Float32Array) => {
+    if (!audioContextRef.current || !livePreview || !analyserRef.current) return;
     try {
       const ctx = audioContextRef.current;
-      const float32Data = convertInt16ToFloat32(pcmData);
       const buffer = ctx.createBuffer(1, float32Data.length, 24000);
       buffer.getChannelData(0).set(float32Data);
+      
       const source = ctx.createBufferSource();
       source.buffer = buffer;
-      source.connect(ctx.destination);
+      source.connect(analyserRef.current);
+      
       const startTime = Math.max(ctx.currentTime, nextAudioStartTimeRef.current);
       source.start(startTime);
       nextAudioStartTimeRef.current = startTime + buffer.duration;
@@ -374,14 +422,15 @@ export default function App() {
     setAbortController(controller);
 
     try {
-      const chunks = splitTextIdeally(currentText, CHUNK_SIZE);
+      setProgressMessage('Analyzing text structure...');
+      const chunks: string[] = await workerRpc('SPLIT_TEXT', { text: currentText, chunkSize: CHUNK_SIZE });
+      
       setTotalChunksCount(chunks.length);
 
       const dynamicKeyProvider = (peek: boolean = false) => {
         const best = getBestKey();
         if (!best) throw new Error("No keys available");
         
-        // Only update UI and record usage if we are COMMITTING to using this key (peek=false)
         if (!peek) {
           const idx = apiKeysRef.current.indexOf(best.key);
           if (idx !== -1) {
@@ -392,20 +441,12 @@ export default function App() {
           }
           recordKeyUsage(best.key);
         }
-        
         return best.key;
       };
 
       for (let i = 0; i < chunks.length; i++) {
         if (controller.signal.aborted) throw new Error("Generation cancelled.");
 
-        // --- DYNAMIC WAIT LOOP ---
-        // Instead of calculating a fixed wait time once, we check constantly.
-        // This handles:
-        // 1. Natural countdown (seconds decreasing)
-        // 2. Switching to a better key (e.g. if one clears up sooner)
-        // 3. Manual skips (user bans current key, 'best' immediately becomes another key)
-        
         let bestKeyData = getBestKey();
         
         while (bestKeyData && bestKeyData.waitTime > 0) {
@@ -414,14 +455,9 @@ export default function App() {
            const waitSeconds = Math.ceil(bestKeyData.waitTime / 1000);
            const keyIndex = apiKeysRef.current.indexOf(bestKeyData.key) + 1;
            
-           setProgressMessage(`All keys busy. Cooling down: ${waitSeconds}s... (Waiting on Key ${keyIndex})`);
+           setProgressMessage(`All keys busy (RPM Limit: ${rpmLimit}). Cooling down: ${waitSeconds}s... (Waiting on Key ${keyIndex})`);
            
-           // Wait a short tick (200ms) for UI updates and responsiveness
            await new Promise(r => setTimeout(r, 200));
-           
-           // RE-EVALUATE:
-           // If user clicked Skip, getBestKey() will return a NEW key (with likely lower wait time).
-           // If time passed, waitTime will decrease.
            bestKeyData = getBestKey();
         }
         
@@ -429,7 +465,6 @@ export default function App() {
 
         const previousContext = i > 0 ? chunks[i-1].slice(-200) : undefined;
 
-        // Pass the provider to the service
         const base64Audio = await generateSpeechFromText({
           text: chunks[i],
           instruction,
@@ -444,18 +479,21 @@ export default function App() {
 
         if (controller.signal.aborted) throw new Error("Cancelled.");
 
-        const pcmData = base64ToUint8Array(base64Audio);
-        pcmChunksRef.current.push(pcmData);
+        const result = await workerRpc('PROCESS_PCM', { base64: base64Audio });
+        const { pcmUint8, float32 } = result;
+
+        pcmChunksRef.current.push(pcmUint8);
         
-        if (livePreview) playChunkLive(pcmData);
+        if (livePreview) playChunkLive(float32);
 
         setProcessedChunks(i + 1);
         setProgress(((i + 1) / chunks.length) * 100);
       }
 
       setProgressMessage('Finalizing audio...');
-      const mergedPcm = mergeBuffers(pcmChunksRef.current);
-      const wavBuffer = pcmToWav(mergedPcm.buffer);
+      
+      const wavBuffer = await workerRpc('EXPORT_WAV', { chunks: pcmChunksRef.current });
+      
       const blob = new Blob([wavBuffer], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
       
@@ -522,6 +560,15 @@ export default function App() {
             </div>
             
             <div className="flex items-center gap-3">
+              {/* SETTINGS BUTTON */}
+              <button
+                onClick={() => setIsSettingsOpen(true)}
+                className="p-2.5 rounded-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700 transition-all shadow-sm"
+                title="Settings & Limits"
+              >
+                <Settings className="w-5 h-5" />
+              </button>
+
               <button
                 onClick={() => setIsApiModalOpen(true)}
                 className={`
@@ -586,7 +633,7 @@ export default function App() {
                  <div>
                    <h3 className="text-sm font-bold text-indigo-900 dark:text-indigo-200 mb-1">Smart Key Pool</h3>
                    <p className="text-xs text-indigo-700/80 dark:text-indigo-300/70 leading-relaxed">
-                     We balance load across all available keys. Hit "Skip" if a key gets stuck cooling down to force a rotation.
+                     Current RPM Limit: {rpmLimit}. Hit "Skip" if a key gets stuck cooling down.
                    </p>
                  </div>
               </div>
@@ -732,8 +779,13 @@ export default function App() {
                       </div>
                     ) : isGenerating ? (
                       // GENERATING STATE CONTROLS
-                      <div className="w-full flex items-center justify-between px-4">
-                         <div className="flex items-center gap-3">
+                      <div className="w-full flex items-center justify-between gap-4 px-4">
+                        {/* Audio Visualizer Canvas */}
+                        <div className="flex-1 mr-4">
+                           <AudioVisualizer analyser={analyserRef.current} isGenerating={livePreview && !isPreviewPaused} />
+                        </div>
+
+                         <div className="flex items-center gap-3 shrink-0">
                            {livePreview && (
                               <button 
                                 onClick={togglePreviewPause}
@@ -764,7 +816,7 @@ export default function App() {
                          
                          <button 
                             onClick={handleStop}
-                            className="flex items-center gap-2 text-xs font-bold text-red-500 hover:text-red-700 px-3 py-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
+                            className="flex items-center gap-2 text-xs font-bold text-red-500 hover:text-red-700 px-3 py-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors shrink-0"
                          >
                            <StopCircle className="w-4 h-4" />
                            <span>Cancel</span>
@@ -805,6 +857,13 @@ export default function App() {
             onSave={handleSaveApiKeys}
             onDisconnect={handleDisconnectApiKey}
             hasKey={keyCount > 0}
+          />
+
+          <SettingsModal 
+            isOpen={isSettingsOpen}
+            onClose={() => setIsSettingsOpen(false)}
+            currentRpm={rpmLimit}
+            onSave={setRpmLimit}
           />
         </div>
       </div>
