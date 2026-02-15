@@ -1,6 +1,6 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save, Layers, Zap } from 'lucide-react';
+import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save, Layers, Zap, FastForward } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus } from './types';
 import { generateSpeechFromText } from './services/geminiService';
 import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
@@ -60,13 +60,17 @@ function splitTextIdeally(text: string, maxLength: number): string[] {
 export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(false);
   
-  // API Key State (Now supports multiple keys)
+  // API Key State
   const [apiKeys, setApiKeys] = useState<string[]>([]);
-  const apiKeysRef = useRef<string[]>([]); // Ref for hot-swapping access
+  const apiKeysRef = useRef<string[]>([]);
   const [isApiModalOpen, setIsApiModalOpen] = useState(false);
 
-  // Rate Limiting History Ref: Record<ApiKey, Timestamp[]>
+  // Rate Limiting History Ref
   const requestHistoryRef = useRef<Record<string, number[]>>({});
+  
+  // Active Key Tracking
+  const [activeKeyIndex, setActiveKeyIndex] = useState<number | null>(null);
+  const activeKeyRef = useRef<string | null>(null);
 
   // Content State
   const [text, setText] = useState('Welcome to the Gemini Voice Studio. I can transform any text into lifelike speech.\n\nSelect Hindi from the menu to hear me speak in a native Indian accent. I will highlight the text as I read it.');
@@ -83,7 +87,7 @@ export default function App() {
   const [abortController, setAbortController] = useState<AbortController | null>(null);
 
   // Timeline & Buffer State
-  const [progress, setProgress] = useState(0); // 0-100
+  const [progress, setProgress] = useState(0); 
   const [processedChunks, setProcessedChunks] = useState(0);
   const [totalChunksCount, setTotalChunksCount] = useState(0);
   const pcmChunksRef = useRef<Uint8Array[]>([]);
@@ -136,7 +140,6 @@ export default function App() {
   };
 
   const handleSaveApiKeys = (keysString: string) => {
-    // Split by newlines or commas, trim whitespace, filter empty
     const keys = keysString.split(/[\n,]+/).map(k => k.trim()).filter(k => k.length > 0);
     setApiKeys(keys);
     apiKeysRef.current = keys;
@@ -181,28 +184,22 @@ export default function App() {
   // --- SMART KEY POOL LOGIC ---
   
   const getKeyStatus = (key: string, now: number) => {
-    // Init history if missing
     if (!requestHistoryRef.current[key]) {
       requestHistoryRef.current[key] = [];
     }
-
-    // 1. Clean up old timestamps (older than 1 minute)
+    // Clean up old timestamps
     requestHistoryRef.current[key] = requestHistoryRef.current[key].filter(
       timestamp => now - timestamp < RATE_WINDOW_MS
     );
-
     const history = requestHistoryRef.current[key];
     const count = history.length;
     let waitTime = 0;
-
-    // 2. Calculate wait time if limit reached
     if (count >= MAX_RPM_PER_KEY) {
       const oldestRequestTime = history[0];
       const timeSinceOldest = now - oldestRequestTime;
-      const needed = RATE_WINDOW_MS - timeSinceOldest + 1000; // +1s buffer
+      const needed = RATE_WINDOW_MS - timeSinceOldest + 1000;
       waitTime = Math.max(0, needed);
     }
-    
     return { key, waitTime, count };
   };
 
@@ -213,10 +210,6 @@ export default function App() {
      const now = Date.now();
      const statuses = keys.map(k => getKeyStatus(k, now));
 
-     // Sort keys:
-     // 1. Keys that don't need to wait come first
-     // 2. Among free keys, pick the one with LEAST usage (Load Balancing)
-     // 3. Among busy keys, pick the one with SHORTEST wait time
      statuses.sort((a, b) => {
        if (a.waitTime !== b.waitTime) return a.waitTime - b.waitTime;
        return a.count - b.count;
@@ -230,6 +223,24 @@ export default function App() {
     requestHistoryRef.current[key].push(Date.now());
   };
 
+  const handleSkipKey = () => {
+    const currentKey = activeKeyRef.current;
+    if (!currentKey) return;
+
+    // Artificially fill the history for this key to force a cooldown
+    if (!requestHistoryRef.current[currentKey]) requestHistoryRef.current[currentKey] = [];
+    
+    const now = Date.now();
+    const needed = MAX_RPM_PER_KEY - requestHistoryRef.current[currentKey].length;
+    
+    // Add enough fake timestamps to max it out + 1 to be safe
+    for (let i = 0; i <= needed + 1; i++) {
+        requestHistoryRef.current[currentKey].push(now);
+    }
+    
+    setProgressMessage(`Skipping current key (Key ${apiKeysRef.current.indexOf(currentKey) + 1})...`);
+    // The loop in handleGenerate will pick this up on next iteration or wait cycle
+  };
 
   // --- LIVE PREVIEW LOGIC ---
   const initAudioContext = () => {
@@ -278,7 +289,6 @@ export default function App() {
   };
 
   const handleGenerate = async () => {
-    // Check keys
     let keysToUse = apiKeysRef.current;
     if (keysToUse.length === 0) {
       setIsApiModalOpen(true);
@@ -288,11 +298,12 @@ export default function App() {
     const currentText = editorRef.current?.innerText || text;
     if (!currentText.trim()) return;
 
-    // Reset State
     setStatus(TTSStatus.GENERATING);
     setError('');
     setProgress(0);
     setProcessedChunks(0);
+    setActiveKeyIndex(null);
+    activeKeyRef.current = null;
     pcmChunksRef.current = []; 
     if (audioUrl) URL.revokeObjectURL(audioUrl);
     setAudioUrl(null);
@@ -305,53 +316,53 @@ export default function App() {
       const chunks = splitTextIdeally(currentText, CHUNK_SIZE);
       setTotalChunksCount(chunks.length);
 
-      // --- SEQUENTIAL PROCESSING ---
       for (let i = 0; i < chunks.length; i++) {
         if (controller.signal.aborted) throw new Error("Generation cancelled.");
 
-        // SMART KEY SELECTION (POOL STRATEGY)
-        // We re-evaluate the best key before EVERY chunk, so we always pick the freshest one.
-        // This handles hot-swapping keys automatically because apiKeysRef is read inside getBestKey.
+        // SMART KEY SELECTION
         const bestKeyData = getBestKey();
         if (!bestKeyData) throw new Error("No API keys available.");
         
         const { key: currentKey, waitTime } = bestKeyData;
 
-        // If even the best key needs waiting, we must wait
+        // Update active key tracking
+        activeKeyRef.current = currentKey;
+        const currentKeyIndex = apiKeysRef.current.indexOf(currentKey);
+        setActiveKeyIndex(currentKeyIndex !== -1 ? currentKeyIndex + 1 : null);
+
+        // Wait if needed
         if (waitTime > 0) {
            const seconds = Math.ceil(waitTime / 1000);
            for (let w = seconds; w > 0; w--) {
              if (controller.signal.aborted) throw new Error("Cancelled.");
-             // Allow user to break out of wait by adding new keys
-             // We check inside the wait loop if a better key appeared? 
-             // Ideally yes, but for simplicity, we wait. 
-             // Actually, to support "change API key in between cooling down", 
-             // we can check if keys length changed or just re-eval.
-             // But simpler is to let the user know they can add keys.
-             setProgressMessage(`All keys hitting limits. Cooling down: ${w}s... (Add more keys to skip)`);
+             
+             setProgressMessage(`Cooling down: ${w}s... (Key ${currentKeyIndex + 1} Limit)`);
              await new Promise(r => setTimeout(r, 1000));
              
-             // Optimization: Check if a better key became available (user added one)
+             // Check if a better key became available (or user skipped current one)
              const freshCheck = getBestKey();
-             if (freshCheck && freshCheck.waitTime === 0) {
-                 break; // Stop waiting, we found a fresh key!
+             if (freshCheck && freshCheck.key !== currentKey && freshCheck.waitTime === 0) {
+                 break; // Switch to new key
              }
            }
         }
         
-        // Re-fetch best key after wait (it might be a different one now, or the same one is ready)
+        // Re-fetch best key after wait/skip
         const finalKeyData = getBestKey();
         if (!finalKeyData) throw new Error("Keys removed during generation.");
         const finalKey = finalKeyData.key;
 
-        // Record usage immediately (Pessimistic concurrency)
+        // Update tracker again if switched
+        activeKeyRef.current = finalKey;
+        const finalKeyIndex = apiKeysRef.current.indexOf(finalKey);
+        setActiveKeyIndex(finalKeyIndex !== -1 ? finalKeyIndex + 1 : null);
+
         recordKeyUsage(finalKey);
 
         setProgressMessage(`Rendering segment ${i + 1} of ${chunks.length}`);
 
         const previousContext = i > 0 ? chunks[i-1].slice(-200) : undefined;
 
-        // Generate
         const base64Audio = await generateSpeechFromText({
           text: chunks[i],
           instruction,
@@ -384,9 +395,10 @@ export default function App() {
       setAudioUrl(url);
       setStatus(TTSStatus.SUCCESS);
       setProgressMessage('');
+      setActiveKeyIndex(null);
 
     } catch (err: any) {
-      if (err.message === "Cancelled." || err.message.includes("cancelled") || err.message.includes("Generation cancelled")) {
+      if (err.message === "Cancelled." || err.message.includes("cancelled")) {
         setStatus(TTSStatus.IDLE);
         setProgressMessage('Stopped by user.');
       } else {
@@ -394,6 +406,7 @@ export default function App() {
         setStatus(TTSStatus.ERROR);
         setProgressMessage('');
       }
+      setActiveKeyIndex(null);
     } finally {
       setAbortController(null);
     }
@@ -407,10 +420,11 @@ export default function App() {
     }
     setStatus(TTSStatus.IDLE);
     setProgressMessage('Stopped.');
+    setActiveKeyIndex(null);
   };
 
   const isGenerating = status === TTSStatus.GENERATING;
-  const isRateLimit = progressMessage.toLowerCase().includes('cooling') || progressMessage.toLowerCase().includes('limit') || progressMessage.toLowerCase().includes('throttling');
+  const isRateLimit = progressMessage.toLowerCase().includes('cooling') || progressMessage.toLowerCase().includes('limit');
   const keyCount = apiKeys.length;
 
   return (
@@ -504,7 +518,7 @@ export default function App() {
                  <div>
                    <h3 className="text-sm font-bold text-indigo-900 dark:text-indigo-200 mb-1">Smart Key Pool</h3>
                    <p className="text-xs text-indigo-700/80 dark:text-indigo-300/70 leading-relaxed">
-                     We automatically skip "cooling" keys and balance load across all available keys. We only wait if ALL keys are busy.
+                     We balance load across all available keys. Hit "Skip" if a key gets stuck cooling down to force a rotation.
                    </p>
                  </div>
               </div>
@@ -568,7 +582,14 @@ export default function App() {
                 {isGenerating && (
                   <div className="border-t border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/50 px-6 py-4 z-30">
                      <div className="flex items-center justify-between mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                        <span>Timeline</span>
+                        <div className="flex items-center gap-2">
+                           <span>Progress</span>
+                           {activeKeyIndex !== null && (
+                             <span className="px-1.5 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 text-[10px]">
+                               Using Key {activeKeyIndex}
+                             </span>
+                           )}
+                        </div>
                         <span>{Math.round(progress)}% Complete</span>
                      </div>
                      <div className="relative h-2 w-full bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden">
@@ -582,8 +603,8 @@ export default function App() {
                            Segment {processedChunks + 1} / {totalChunksCount}
                         </span>
                         
-                        {/* Status Message */}
-                        <div className="flex items-center gap-2">
+                        {/* Status Message & Skip */}
+                        <div className="flex items-center gap-3">
                            {isRateLimit ? (
                              <span className="text-xs text-amber-600 dark:text-amber-400 font-bold flex items-center gap-1">
                                <Clock className="w-3 h-3" /> {progressMessage}
@@ -592,6 +613,15 @@ export default function App() {
                              <span className="text-xs text-indigo-600 dark:text-indigo-400 flex items-center gap-1">
                                <Loader2 className="w-3 h-3 animate-spin" /> {progressMessage || 'Rendering...'}
                              </span>
+                           )}
+
+                           {keyCount > 1 && (
+                             <button
+                               onClick={handleSkipKey}
+                               className="px-2 py-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded text-[10px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300 hover:border-amber-300 hover:text-amber-600 transition-all flex items-center gap-1 pointer-events-auto"
+                             >
+                               <FastForward className="w-3 h-3" /> Skip Key
+                             </button>
                            )}
                         </div>
                      </div>
