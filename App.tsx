@@ -1,6 +1,6 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save, Layers } from 'lucide-react';
+import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save, Layers, Zap } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus } from './types';
 import { generateSpeechFromText } from './services/geminiService';
 import { pcmToWav, base64ToUint8Array, mergeBuffers, convertInt16ToFloat32 } from './utils/audioUtils';
@@ -178,10 +178,10 @@ export default function App() {
     }
   };
 
-  // --- SMART THROTTLING LOGIC ---
-  const checkAndThrottle = async (key: string) => {
-    const now = Date.now();
-    // Initialize history for this key if needed
+  // --- SMART KEY POOL LOGIC ---
+  
+  const getKeyStatus = (key: string, now: number) => {
+    // Init history if missing
     if (!requestHistoryRef.current[key]) {
       requestHistoryRef.current[key] = [];
     }
@@ -191,28 +191,45 @@ export default function App() {
       timestamp => now - timestamp < RATE_WINDOW_MS
     );
 
-    // 2. Check if we hit the limit
     const history = requestHistoryRef.current[key];
-    if (history.length >= MAX_RPM_PER_KEY) {
-      // We are maxed out. Calculate time until the oldest request expires.
-      // The oldest request is history[0] because we append to the end.
+    const count = history.length;
+    let waitTime = 0;
+
+    // 2. Calculate wait time if limit reached
+    if (count >= MAX_RPM_PER_KEY) {
       const oldestRequestTime = history[0];
       const timeSinceOldest = now - oldestRequestTime;
-      const waitTime = RATE_WINDOW_MS - timeSinceOldest + 1000; // +1s buffer
-
-      if (waitTime > 0) {
-        // Wait...
-        const seconds = Math.ceil(waitTime / 1000);
-        for (let i = seconds; i > 0; i--) {
-           setProgressMessage(`Throttling: Waiting ${i}s for key capacity...`);
-           await new Promise(r => setTimeout(r, 1000));
-        }
-      }
+      const needed = RATE_WINDOW_MS - timeSinceOldest + 1000; // +1s buffer
+      waitTime = Math.max(0, needed);
     }
+    
+    return { key, waitTime, count };
+  };
 
-    // 3. Record this new request (Optimistic recording)
+  const getBestKey = () => {
+     const keys = apiKeysRef.current;
+     if (keys.length === 0) return null;
+     
+     const now = Date.now();
+     const statuses = keys.map(k => getKeyStatus(k, now));
+
+     // Sort keys:
+     // 1. Keys that don't need to wait come first
+     // 2. Among free keys, pick the one with LEAST usage (Load Balancing)
+     // 3. Among busy keys, pick the one with SHORTEST wait time
+     statuses.sort((a, b) => {
+       if (a.waitTime !== b.waitTime) return a.waitTime - b.waitTime;
+       return a.count - b.count;
+     });
+     
+     return statuses[0];
+  };
+
+  const recordKeyUsage = (key: string) => {
+    if (!requestHistoryRef.current[key]) requestHistoryRef.current[key] = [];
     requestHistoryRef.current[key].push(Date.now());
   };
+
 
   // --- LIVE PREVIEW LOGIC ---
   const initAudioContext = () => {
@@ -292,32 +309,56 @@ export default function App() {
       for (let i = 0; i < chunks.length; i++) {
         if (controller.signal.aborted) throw new Error("Generation cancelled.");
 
-        // STRATEGY 2: KEY ROTATION
-        // We get the latest keys from ref inside loop to allow hot-swapping
-        const currentKeys = apiKeysRef.current;
-        if (currentKeys.length === 0) throw new Error("No API keys available.");
+        // SMART KEY SELECTION (POOL STRATEGY)
+        // We re-evaluate the best key before EVERY chunk, so we always pick the freshest one.
+        // This handles hot-swapping keys automatically because apiKeysRef is read inside getBestKey.
+        const bestKeyData = getBestKey();
+        if (!bestKeyData) throw new Error("No API keys available.");
         
-        // Round Robin selection
-        const keyIndex = i % currentKeys.length;
-        const currentKey = currentKeys[keyIndex];
+        const { key: currentKey, waitTime } = bestKeyData;
 
-        // STRATEGY 4: SMART THROTTLING
-        // Check if THIS specific key needs to wait
-        await checkAndThrottle(currentKey);
+        // If even the best key needs waiting, we must wait
+        if (waitTime > 0) {
+           const seconds = Math.ceil(waitTime / 1000);
+           for (let w = seconds; w > 0; w--) {
+             if (controller.signal.aborted) throw new Error("Cancelled.");
+             // Allow user to break out of wait by adding new keys
+             // We check inside the wait loop if a better key appeared? 
+             // Ideally yes, but for simplicity, we wait. 
+             // Actually, to support "change API key in between cooling down", 
+             // we can check if keys length changed or just re-eval.
+             // But simpler is to let the user know they can add keys.
+             setProgressMessage(`All keys hitting limits. Cooling down: ${w}s... (Add more keys to skip)`);
+             await new Promise(r => setTimeout(r, 1000));
+             
+             // Optimization: Check if a better key became available (user added one)
+             const freshCheck = getBestKey();
+             if (freshCheck && freshCheck.waitTime === 0) {
+                 break; // Stop waiting, we found a fresh key!
+             }
+           }
+        }
+        
+        // Re-fetch best key after wait (it might be a different one now, or the same one is ready)
+        const finalKeyData = getBestKey();
+        if (!finalKeyData) throw new Error("Keys removed during generation.");
+        const finalKey = finalKeyData.key;
 
-        setProgressMessage(`Rendering segment ${i + 1} of ${chunks.length} (Key ${keyIndex + 1})`);
+        // Record usage immediately (Pessimistic concurrency)
+        recordKeyUsage(finalKey);
+
+        setProgressMessage(`Rendering segment ${i + 1} of ${chunks.length}`);
 
         const previousContext = i > 0 ? chunks[i-1].slice(-200) : undefined;
 
         // Generate
-        // We pass the specific key rotated for this chunk
         const base64Audio = await generateSpeechFromText({
           text: chunks[i],
           instruction,
           voice: selectedVoice,
           language: selectedLanguage,
           previousContext: previousContext,
-        }, currentKey, (statusMsg) => {
+        }, finalKey, (statusMsg) => {
            if (statusMsg.includes('limit') || statusMsg.includes('Cooling') || statusMsg.includes('Verifying')) {
              setProgressMessage(statusMsg);
            }
@@ -458,12 +499,12 @@ export default function App() {
               
               <div className="bg-gradient-to-br from-indigo-50 to-purple-50 dark:from-indigo-900/20 dark:to-purple-900/20 border border-indigo-100 dark:border-indigo-500/10 rounded-xl p-4 flex gap-3 items-start shrink-0">
                  <div className="bg-indigo-100 dark:bg-indigo-500/20 p-2 rounded-lg shrink-0">
-                   <Wand2 className="w-4 h-4 text-indigo-600 dark:text-indigo-300" />
+                   <Zap className="w-4 h-4 text-indigo-600 dark:text-indigo-300" />
                  </div>
                  <div>
-                   <h3 className="text-sm font-bold text-indigo-900 dark:text-indigo-200 mb-1">Smart Optimization</h3>
+                   <h3 className="text-sm font-bold text-indigo-900 dark:text-indigo-200 mb-1">Smart Key Pool</h3>
                    <p className="text-xs text-indigo-700/80 dark:text-indigo-300/70 leading-relaxed">
-                     Key Rotation & Request Throttling are active. We intelligently rotate your keys and wait exactly when needed to prevent API blocks.
+                     We automatically skip "cooling" keys and balance load across all available keys. We only wait if ALL keys are busy.
                    </p>
                  </div>
               </div>
