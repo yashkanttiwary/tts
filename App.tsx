@@ -233,32 +233,27 @@ export default function App() {
     const currentKey = activeKeyRef.current;
     if (!currentKey) return;
 
-    // Artificially fill the history for this key to force a cooldown
-    if (!requestHistoryRef.current[currentKey]) requestHistoryRef.current[currentKey] = [];
-    
+    // To aggressively ban this key, we clear its history and fill it with CURRENT timestamps.
+    // This forces 'oldestRequestTime' to be NOW.
+    // Result: waitTime = 60s - (now - now) = 60s.
+    // This pushes it to the absolute bottom of the priority queue.
     const now = Date.now();
-    const needed = MAX_RPM_PER_KEY - requestHistoryRef.current[currentKey].length;
-    
-    // Add enough fake timestamps to max it out + 1 to be safe
-    // This effectively "bans" the key for 1 minute
-    for (let i = 0; i <= needed + 1; i++) {
+    requestHistoryRef.current[currentKey] = []; // Clear old history
+    for (let i = 0; i < MAX_RPM_PER_KEY + 1; i++) {
         requestHistoryRef.current[currentKey].push(now);
     }
     
     setProgressMessage(`Skipping Key ${apiKeysRef.current.indexOf(currentKey) + 1}... switching...`);
-    // NOTE: The service loop polls 'dynamicKeyProvider' which calls 'getBestKey'.
-    // Since 'getBestKey' sorts by waitTime, and we just increased waitTime for currentKey,
-    // it will immediately return a different key, causing the service to break its wait loop.
+    // Note: The service loop (or the wait loop below) polls 'getBestKey'.
+    // Since we just maxed out the waitTime for 'currentKey', 'getBestKey' will immediately return a different key.
   };
 
   // --- PREVIEW LOGIC (NEW) ---
   const handleVoicePreview = async (voiceName: string): Promise<string> => {
-    // 1. Check LocalStorage Cache
     const cacheKey = `preview_sample_${voiceName}`;
     const cachedBase64 = localStorage.getItem(cacheKey);
     
     if (cachedBase64) {
-      // Convert cached base64 WAV to blob URL
       const byteCharacters = atob(cachedBase64);
       const byteNumbers = new Array(byteCharacters.length);
       for (let i = 0; i < byteCharacters.length; i++) {
@@ -269,23 +264,15 @@ export default function App() {
       return URL.createObjectURL(blob);
     }
 
-    // 2. If not cached, we need an API key
     if (apiKeysRef.current.length === 0) {
       setIsApiModalOpen(true);
       throw new Error("Please connect an API key to generate samples.");
     }
 
-    // 3. Generate Sample
-    // We create a specific text for each voice to show off its personality
     const voiceData = VOICES.find(v => v.name === voiceName);
     const sampleText = `Hello! I am ${voiceName}. I have a ${voiceData?.style.toLowerCase()} voice.`;
     
     const keyData = getBestKey();
-    if (!keyData || keyData.waitTime > 0) {
-      // For previews, we are less strict about waiting, but still good to check
-      // If all keys are busy, we just grab the first one and hope for the best, 
-      // or throw error. Let's try to use the best key.
-    }
     const keyToUse = keyData ? keyData.key : apiKeysRef.current[0];
     recordKeyUsage(keyToUse);
 
@@ -296,12 +283,8 @@ export default function App() {
       language: 'en'
     }, keyToUse);
 
-    // 4. Convert PCM to WAV for playback
     const pcmData = base64ToUint8Array(base64Audio);
     const wavBuffer = pcmToWav(pcmData.buffer);
-    
-    // 5. Cache the WAV file as Base64 (so we can store in localStorage)
-    // We do this manually to save space (WAV is slightly larger than raw PCM but safer for playback)
     const wavUint8 = new Uint8Array(wavBuffer);
     let binary = '';
     const len = wavUint8.byteLength;
@@ -316,7 +299,6 @@ export default function App() {
       console.warn("LocalStorage full, could not cache sample.");
     }
 
-    // 6. Return Blob URL
     const blob = new Blob([wavBuffer], { type: 'audio/wav' });
     return URL.createObjectURL(blob);
   };
@@ -395,9 +377,6 @@ export default function App() {
       const chunks = splitTextIdeally(currentText, CHUNK_SIZE);
       setTotalChunksCount(chunks.length);
 
-      // --- KEY PROVIDER FUNCTION ---
-      // This function determines the best key to use for each attempt.
-      // 'peek' = true means we just want to know the best key without recording usage (for polling)
       const dynamicKeyProvider = (peek: boolean = false) => {
         const best = getBestKey();
         if (!best) throw new Error("No keys available");
@@ -420,26 +399,30 @@ export default function App() {
       for (let i = 0; i < chunks.length; i++) {
         if (controller.signal.aborted) throw new Error("Generation cancelled.");
 
-        // Initial check before starting the chunk (for user feedback wait loop)
-        // Note: The service also has a wait loop, but this one catches "all keys busy" BEFORE request.
-        let bestKeyData = getBestKey();
-        if (!bestKeyData) throw new Error("No API keys available.");
+        // --- DYNAMIC WAIT LOOP ---
+        // Instead of calculating a fixed wait time once, we check constantly.
+        // This handles:
+        // 1. Natural countdown (seconds decreasing)
+        // 2. Switching to a better key (e.g. if one clears up sooner)
+        // 3. Manual skips (user bans current key, 'best' immediately becomes another key)
         
-        if (bestKeyData.waitTime > 0) {
-           const seconds = Math.ceil(bestKeyData.waitTime / 1000);
-           for (let w = seconds; w > 0; w--) {
-             if (controller.signal.aborted) throw new Error("Cancelled.");
-             
-             // Check if a better key appeared (e.g. user added key or skipped current hold-up)
-             const freshCheck = getBestKey();
-             if (freshCheck && freshCheck.waitTime === 0) {
-                 break; // Stop waiting!
-             }
+        let bestKeyData = getBestKey();
+        
+        while (bestKeyData && bestKeyData.waitTime > 0) {
+           if (controller.signal.aborted) throw new Error("Cancelled.");
 
-             const holdUpIndex = apiKeysRef.current.indexOf(bestKeyData.key) + 1;
-             setProgressMessage(`All keys busy. Cooling down: ${w}s... (Waiting on Key ${holdUpIndex})`);
-             await new Promise(r => setTimeout(r, 1000));
-           }
+           const waitSeconds = Math.ceil(bestKeyData.waitTime / 1000);
+           const keyIndex = apiKeysRef.current.indexOf(bestKeyData.key) + 1;
+           
+           setProgressMessage(`All keys busy. Cooling down: ${waitSeconds}s... (Waiting on Key ${keyIndex})`);
+           
+           // Wait a short tick (200ms) for UI updates and responsiveness
+           await new Promise(r => setTimeout(r, 200));
+           
+           // RE-EVALUATE:
+           // If user clicked Skip, getBestKey() will return a NEW key (with likely lower wait time).
+           // If time passed, waitTime will decrease.
+           bestKeyData = getBestKey();
         }
         
         setProgressMessage(`Rendering segment ${i + 1} of ${chunks.length}`);
