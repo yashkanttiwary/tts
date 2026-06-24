@@ -1,5 +1,6 @@
 {
   "name": "Gemini Voice Studio",
-  "description": "Professional Text-to-Speech generator using Gemini 2.5 Flash TTS with smart batch processing for high speed.",
-  "requestFramePermissions": []
+  "description": "Professional Text-to-Speech generator using Gemini 3.1 Flash TTS with smart batch processing for high speed.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
 }

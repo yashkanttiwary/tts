@@ -39,7 +39,7 @@ export const generateSpeechFromText = async (
   }
 
   // Using the specialized TTS model which supports AUDIO output
-  const modelName = "gemini-2.5-flash-preview-tts";
+  const modelName = "gemini-3.1-flash-tts-preview";
 
   // Language direction logic
   let languageDirective = "";
