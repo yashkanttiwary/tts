@@ -21,7 +21,7 @@ const VOICES: VoiceOption[] = [
   { name: 'Kore', gender: 'Female', style: 'Firm & Clear', description: 'Excellent for educational and instructional content.' },
   { name: 'Charon', gender: 'Male', style: 'Deep & Authoritative', description: 'Perfect for news, announcements, and serious topics.' },
   { name: 'Fenrir', gender: 'Male', style: 'Fast & Energetic', description: 'Ideal for gaming, hype, and high-energy narration.' },
-  { name: 'Aoede', gender: 'Female', style: 'Warm & Breezy', description: 'Good for podcasts, blogs, and casual conversation.' },
+  { name: 'Zephyr', gender: 'Neutral', style: 'Warm & Breezy', description: 'Good for podcasts, blogs, and casual conversation.' },
 ];
 
 const PRESETS: PresetOption[] = [
@@ -549,7 +549,7 @@ export default function App() {
             <div className="text-center md:text-left space-y-2">
               <div className="inline-flex items-center gap-2 bg-white/80 dark:bg-slate-800/80 backdrop-blur border border-slate-200 dark:border-slate-700/50 px-3 py-1 rounded-full text-xs font-semibold text-indigo-600 dark:text-indigo-300 shadow-sm">
                 <Sparkles className="w-3.5 h-3.5" />
-                <span>Gemini 2.5 Flash TTS</span>
+                <span>Gemini 3.1 Flash TTS</span>
               </div>
               <h1 className="text-3xl md:text-4xl font-extrabold tracking-tight text-slate-900 dark:text-white">
                 Gemini Voice Studio
