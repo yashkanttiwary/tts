@@ -1,8 +1,8 @@
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save, Layers, Zap, FastForward, Settings } from 'lucide-react';
+import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save, Layers, Zap, FastForward, Settings, Users } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus } from './types';
-import { generateSpeechFromText } from './services/geminiService';
+import { generateSpeechFromText, detectSpeakers, SpeakerSegment } from './services/geminiService';
 import VoiceSelector from './components/VoiceSelector';
 import StylePresets from './components/StylePresets';
 import LanguageSelector from './components/LanguageSelector';
@@ -72,6 +72,10 @@ export default function App() {
   const [instruction, setInstruction] = useState('');
   const [selectedVoice, setSelectedVoice] = useState('Puck');
   const [selectedLanguage, setSelectedLanguage] = useState('en');
+  const [isMultiSpeaker, setIsMultiSpeaker] = useState(false);
+  const [detectedSpeakers, setDetectedSpeakers] = useState<SpeakerSegment[]>([]);
+  const [speakerVoiceMap, setSpeakerVoiceMap] = useState<Record<string, string>>({});
+  const [isDetecting, setIsDetecting] = useState(false);
   
   // Generation State
   const [status, setStatus] = useState<TTSStatus>(TTSStatus.IDLE);
@@ -397,6 +401,46 @@ export default function App() {
     }
   };
 
+  const handleDetectSpeakers = async () => {
+    const currentText = editorRef.current?.innerText || text;
+    if (!currentText.trim()) {
+      setError('Please enter some text first.');
+      return;
+    }
+
+    let keysToUse = apiKeysRef.current;
+    if (keysToUse.length === 0) {
+      setIsApiModalOpen(true);
+      return;
+    }
+
+    setIsDetecting(true);
+    setError('');
+    
+    try {
+      const keyData = getBestKey();
+      const keyToUse = keyData ? keyData.key : apiKeysRef.current[0];
+      recordKeyUsage(keyToUse);
+
+      const segments = await detectSpeakers(currentText, keyToUse);
+      setDetectedSpeakers(segments);
+      
+      // Auto-assign voices to unique speakers
+      const uniqueSpeakers = Array.from(new Set(segments.map(s => s.speaker)));
+      const newMap: Record<string, string> = {};
+      uniqueSpeakers.forEach((speaker, idx) => {
+        // Round robin voice assignment if there are more speakers than voices
+        newMap[speaker] = speakerVoiceMap[speaker] || VOICES[idx % VOICES.length].name;
+      });
+      setSpeakerVoiceMap(newMap);
+      setIsMultiSpeaker(true);
+    } catch (err: any) {
+      setError(err.message || 'Failed to detect speakers');
+    } finally {
+      setIsDetecting(false);
+    }
+  };
+
   const handleGenerate = async () => {
     let keysToUse = apiKeysRef.current;
     if (keysToUse.length === 0) {
@@ -423,9 +467,22 @@ export default function App() {
 
     try {
       setProgressMessage('Analyzing text structure...');
-      const chunks: string[] = await workerRpc('SPLIT_TEXT', { text: currentText, chunkSize: CHUNK_SIZE });
+      let generationChunks: {text: string, voice: string}[] = [];
       
-      setTotalChunksCount(chunks.length);
+      if (isMultiSpeaker && detectedSpeakers.length > 0) {
+        for (const segment of detectedSpeakers) {
+           const chunks: string[] = await workerRpc('SPLIT_TEXT', { text: segment.text, chunkSize: CHUNK_SIZE });
+           chunks.forEach(c => generationChunks.push({
+             text: c,
+             voice: speakerVoiceMap[segment.speaker] || selectedVoice
+           }));
+        }
+      } else {
+        const chunks: string[] = await workerRpc('SPLIT_TEXT', { text: currentText, chunkSize: CHUNK_SIZE });
+        generationChunks = chunks.map(c => ({ text: c, voice: selectedVoice }));
+      }
+      
+      setTotalChunksCount(generationChunks.length);
 
       const dynamicKeyProvider = (peek: boolean = false) => {
         const best = getBestKey();
@@ -444,7 +501,7 @@ export default function App() {
         return best.key;
       };
 
-      for (let i = 0; i < chunks.length; i++) {
+      for (let i = 0; i < generationChunks.length; i++) {
         if (controller.signal.aborted) throw new Error("Generation cancelled.");
 
         let bestKeyData = getBestKey();
@@ -461,14 +518,16 @@ export default function App() {
            bestKeyData = getBestKey();
         }
         
-        setProgressMessage(`Rendering segment ${i + 1} of ${chunks.length}`);
+        setProgressMessage(`Rendering segment ${i + 1} of ${generationChunks.length}`);
 
-        const previousContext = i > 0 ? chunks[i-1].slice(-200) : undefined;
+        const previousContext = i > 0 && generationChunks[i].voice === generationChunks[i-1].voice 
+          ? generationChunks[i-1].text.slice(-200) 
+          : undefined;
 
         const base64Audio = await generateSpeechFromText({
-          text: chunks[i],
+          text: generationChunks[i].text,
           instruction,
-          voice: selectedVoice,
+          voice: generationChunks[i].voice,
           language: selectedLanguage,
           previousContext: previousContext,
         }, dynamicKeyProvider, (statusMsg) => {
@@ -487,7 +546,7 @@ export default function App() {
         if (livePreview) playChunkLive(float32);
 
         setProcessedChunks(i + 1);
-        setProgress(((i + 1) / chunks.length) * 100);
+        setProgress(((i + 1) / generationChunks.length) * 100);
       }
 
       setProgressMessage('Finalizing audio...');
@@ -618,6 +677,63 @@ export default function App() {
                   disabled={isGenerating} 
                   onPlayPreview={handleVoicePreview}
                 />
+                
+                <div className="h-px bg-slate-200 dark:bg-slate-800 my-6" />
+
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-semibold text-slate-900 dark:text-white flex items-center gap-2">
+                      <Users className="w-4 h-4 text-indigo-500" />
+                      Multi-Speaker Casting
+                    </h3>
+                    <button
+                      onClick={() => setIsMultiSpeaker(!isMultiSpeaker)}
+                      disabled={isGenerating}
+                      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                        isMultiSpeaker ? 'bg-indigo-600' : 'bg-slate-200 dark:bg-slate-700'
+                      }`}
+                    >
+                      <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                        isMultiSpeaker ? 'translate-x-5' : 'translate-x-1'
+                      }`} />
+                    </button>
+                  </div>
+                  
+                  {isMultiSpeaker && (
+                    <div className="bg-indigo-50/50 dark:bg-indigo-900/10 rounded-xl p-4 border border-indigo-100 dark:border-indigo-800/30">
+                      <button
+                        onClick={handleDetectSpeakers}
+                        disabled={isGenerating || isDetecting}
+                        className="w-full flex items-center justify-center gap-2 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-indigo-300 dark:hover:border-indigo-700 text-sm font-medium py-2 rounded-lg transition-colors disabled:opacity-50"
+                      >
+                        {isDetecting ? <Loader2 className="w-4 h-4 animate-spin text-indigo-500" /> : <Wand2 className="w-4 h-4 text-indigo-500" />}
+                        {isDetecting ? 'Detecting Speakers...' : 'Detect Speakers from Text'}
+                      </button>
+                      
+                      {detectedSpeakers.length > 0 && (
+                        <div className="mt-4 space-y-3">
+                          <p className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Assigned Voices</p>
+                          {Array.from(new Set(detectedSpeakers.map(s => s.speaker))).map(speaker => (
+                            <div key={speaker} className="flex items-center justify-between gap-3">
+                              <span className="text-sm font-medium text-slate-700 dark:text-slate-200 truncate w-1/2" title={speaker}>{speaker}</span>
+                              <select 
+                                value={speakerVoiceMap[speaker] || selectedVoice}
+                                onChange={(e) => setSpeakerVoiceMap(prev => ({...prev, [speaker]: e.target.value}))}
+                                disabled={isGenerating}
+                                className="w-1/2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-sm px-2 py-1.5 focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none text-slate-700 dark:text-slate-200"
+                              >
+                                {VOICES.map(v => (
+                                  <option key={v.name} value={v.name}>{v.name}</option>
+                                ))}
+                              </select>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
                 <div className="h-px bg-slate-200 dark:bg-slate-800 my-6" />
                 <StylePresets 
                   presets={PRESETS} 

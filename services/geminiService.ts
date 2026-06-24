@@ -1,6 +1,54 @@
 
-import { GoogleGenAI, Modality } from "@google/genai";
+import { GoogleGenAI, Modality, Type } from "@google/genai";
 import { GenerationConfig } from "../types";
+
+export interface SpeakerSegment {
+  speaker: string;
+  text: string;
+}
+
+export const detectSpeakers = async (
+  text: string,
+  apiKey: string
+): Promise<SpeakerSegment[]> => {
+  const ai = new GoogleGenAI({ apiKey });
+  
+  const response = await ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: `Analyze the following text and segment it by speaker. Identify the narrator or character speaking.
+Return a JSON array of objects, where each object has:
+- "speaker": string (the name or role of the speaker, e.g., "Narrator", "John", "Alice")
+- "text": string (the exact text spoken by that person, preserving the original text perfectly)
+
+Text:
+${text}
+
+Return ONLY valid JSON. Do not include markdown formatting like \`\`\`json.`,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            speaker: { type: Type.STRING },
+            text: { type: Type.STRING }
+          },
+          required: ["speaker", "text"]
+        }
+      },
+      temperature: 0.1,
+    }
+  });
+
+  const content = response.text;
+  if (!content) throw new Error("No content returned");
+  try {
+    return JSON.parse(content);
+  } catch (e) {
+    throw new Error("Failed to parse JSON from Gemini");
+  }
+};
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
