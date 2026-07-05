@@ -1,6 +1,6 @@
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save, Layers, Zap, FastForward, Settings, Users } from 'lucide-react';
+import { Play, Loader2, AlertCircle, Wand2, RefreshCcw, Sun, Moon, Sparkles, Key, Check, Download, Gauge, Volume2, StopCircle, Clock, Pause, PlayCircle, Save, Layers, Zap, FastForward, Settings, Users, FileText } from 'lucide-react';
 import { VoiceOption, PresetOption, TTSStatus } from './types';
 import { generateSpeechFromText, detectSpeakers, SpeakerSegment } from './services/geminiService';
 import VoiceSelector from './components/VoiceSelector';
@@ -8,6 +8,7 @@ import StylePresets from './components/StylePresets';
 import LanguageSelector from './components/LanguageSelector';
 import ApiKeyModal from './components/ApiKeyModal';
 import SettingsModal from './components/SettingsModal';
+import DocumentScannerModal from './components/DocumentScannerModal';
 import AudioVisualizer from './components/AudioVisualizer';
 import { WORKER_CODE } from './workers/workerBlob';
 
@@ -47,6 +48,8 @@ const pcmToWavLight = (pcmData: Uint8Array): ArrayBuffer => {
    return buffer;
 };
 
+const DEFAULT_TEXT = 'Welcome to the Gemini Voice Studio. I can transform any text into lifelike speech.\n\nSelect Hindi from the menu to hear me speak in a native Indian accent. I will highlight the text as I read it.';
+
 export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(false);
   
@@ -54,6 +57,7 @@ export default function App() {
   const [apiKeys, setApiKeys] = useState<string[]>([]);
   const apiKeysRef = useRef<string[]>([]);
   const [isApiModalOpen, setIsApiModalOpen] = useState(false);
+  const [isDocumentScannerOpen, setIsDocumentScannerOpen] = useState(false);
 
   // Settings State
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -67,7 +71,7 @@ export default function App() {
   const activeKeyRef = useRef<string | null>(null);
 
   // Content State
-  const [text, setText] = useState('Welcome to the Gemini Voice Studio. I can transform any text into lifelike speech.\n\nSelect Hindi from the menu to hear me speak in a native Indian accent. I will highlight the text as I read it.');
+  const [text, setText] = useState(DEFAULT_TEXT);
   
   const [instruction, setInstruction] = useState('');
   const [selectedVoice, setSelectedVoice] = useState('Puck');
@@ -155,6 +159,27 @@ export default function App() {
   const handleInput = () => {
     if (editorRef.current) {
       setText(editorRef.current.innerText);
+    }
+  };
+
+  const handleFocus = () => {
+    if (editorRef.current && text.trim() === DEFAULT_TEXT.trim()) {
+      editorRef.current.innerText = '';
+      setText('');
+    }
+  };
+
+  const handleBlur = () => {
+    if (editorRef.current && editorRef.current.innerText.trim() === '') {
+      editorRef.current.innerText = DEFAULT_TEXT;
+      setText(DEFAULT_TEXT);
+    }
+  };
+
+  const handleDocumentExtract = (extractedText: string) => {
+    if (editorRef.current) {
+      editorRef.current.innerText = extractedText;
+      setText(extractedText);
     }
   };
 
@@ -601,7 +626,7 @@ export default function App() {
           <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] rounded-full bg-purple-200/40 dark:bg-purple-900/10 blur-[100px] transition-colors duration-500"></div>
         </div>
 
-        <div className="relative z-10 max-w-7xl mx-auto px-4 py-6 md:py-10 space-y-8 flex flex-col h-screen md:h-auto">
+        <div className="relative z-10 max-w-7xl mx-auto px-4 py-6 md:py-10 space-y-8 flex flex-col min-h-screen lg:min-h-0">
           
           {/* Header */}
           <header className="flex flex-col md:flex-row items-center justify-between gap-6 pb-2">
@@ -657,10 +682,10 @@ export default function App() {
             </div>
           </header>
 
-          <main className="grid lg:grid-cols-12 gap-6 lg:h-[750px] min-h-0">
+          <main className="flex flex-col lg:grid lg:grid-cols-12 gap-6 lg:h-[750px] min-h-0">
             
             {/* Sidebar: Controls */}
-            <aside className="lg:col-span-4 flex flex-col gap-4 min-h-0">
+            <aside className="lg:col-span-4 flex flex-col gap-4 min-h-0 order-2 lg:order-1">
               <div className="bg-white/80 dark:bg-slate-900/60 backdrop-blur-xl border border-slate-200 dark:border-slate-700/50 rounded-2xl p-6 shadow-sm dark:shadow-xl overflow-y-auto flex-1 custom-scrollbar">
                 
                 <LanguageSelector 
@@ -756,12 +781,12 @@ export default function App() {
             </aside>
 
             {/* Main Content: Editor & Player */}
-            <section className="lg:col-span-8 flex flex-col min-h-[500px]">
+            <section className="lg:col-span-8 flex flex-col min-h-[500px] order-1 lg:order-2">
               <div className="bg-white/90 dark:bg-slate-900/60 backdrop-blur-xl border border-slate-200 dark:border-slate-700/50 rounded-2xl shadow-lg dark:shadow-2xl flex flex-col h-full overflow-hidden transition-all">
                 
                 {/* Toolbar */}
-                <div className="flex items-center gap-3 p-3 border-b border-slate-200 dark:border-slate-700/50 bg-slate-50/50 dark:bg-slate-800/30 z-20 shrink-0">
-                  <div className="flex-1">
+                <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 sm:gap-3 p-3 border-b border-slate-200 dark:border-slate-700/50 bg-slate-50/50 dark:bg-slate-800/30 z-20 shrink-0">
+                  <div className="flex-1 w-full sm:w-auto min-w-[200px]">
                      <input 
                         type="text"
                         value={instruction}
@@ -772,6 +797,17 @@ export default function App() {
                      />
                   </div>
                   
+                  {/* Extract Document Button */}
+                  <button
+                    onClick={() => setIsDocumentScannerOpen(true)}
+                    disabled={isGenerating}
+                    className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold border bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-700 transition-all disabled:opacity-50"
+                    title="Import Text from Document or Image"
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">Import Doc</span>
+                  </button>
+
                   {/* Live Preview Toggle */}
                   <button
                     onClick={() => setLivePreview(!livePreview)}
@@ -796,8 +832,14 @@ export default function App() {
                     ref={editorRef}
                     contentEditable={!isGenerating}
                     onInput={handleInput}
+                    onFocus={handleFocus}
+                    onBlur={handleBlur}
                     data-placeholder="Enter or paste your text here..."
-                    className="rich-text-editor w-full h-full p-6 text-base md:text-lg leading-loose text-slate-800 dark:text-slate-200 focus:outline-none custom-scrollbar"
+                    className={`rich-text-editor w-full h-full p-6 text-base md:text-lg leading-loose focus:outline-none custom-scrollbar transition-all ${
+                      text.trim() === DEFAULT_TEXT.trim()
+                        ? 'text-slate-400 dark:text-slate-500 italic after:content-["|"] after:animate-pulse after:ml-1 after:text-indigo-500 after:font-light'
+                        : 'text-slate-800 dark:text-slate-200'
+                    }`}
                     suppressContentEditableWarning={true}
                   />
                   
@@ -895,47 +937,49 @@ export default function App() {
                       </div>
                     ) : isGenerating ? (
                       // GENERATING STATE CONTROLS
-                      <div className="w-full flex items-center justify-between gap-4 px-4">
+                      <div className="w-full flex items-center justify-between gap-2 sm:gap-4 px-2 sm:px-4">
                         {/* Audio Visualizer Canvas */}
-                        <div className="flex-1 mr-4">
+                        <div className="flex-1 mr-2 sm:mr-4 min-w-[50px]">
                            <AudioVisualizer analyser={analyserRef.current} isGenerating={livePreview && !isPreviewPaused} />
                         </div>
 
-                         <div className="flex items-center gap-3 shrink-0">
+                         <div className="flex items-center gap-2 sm:gap-3 shrink-0">
                            {livePreview && (
                               <button 
                                 onClick={togglePreviewPause}
                                 className={`
-                                  flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-bold uppercase tracking-wider transition-all
+                                  flex items-center gap-2 px-2 sm:px-3 py-1.5 rounded-lg border text-xs font-bold uppercase tracking-wider transition-all
                                   ${isPreviewPaused
                                     ? 'bg-amber-50 dark:bg-amber-900/20 border-amber-200 text-amber-700 dark:text-amber-400'
                                     : 'bg-indigo-50 dark:bg-indigo-900/20 border-indigo-200 text-indigo-700 dark:text-indigo-400 animate-pulse'
                                   }
                                 `}
+                                title={isPreviewPaused ? 'Resume Preview' : 'Live Preview'}
                               >
                                 {isPreviewPaused ? <Play className="w-3.5 h-3.5 fill-current" /> : <Pause className="w-3.5 h-3.5 fill-current" />}
-                                <span>{isPreviewPaused ? 'Resume Preview' : 'Live Preview'}</span>
+                                <span className="hidden sm:inline">{isPreviewPaused ? 'Resume Preview' : 'Live Preview'}</span>
                               </button>
                            )}
                            
                            {processedChunks > 0 && (
                              <button
                                onClick={handleDownloadPartial}
-                               className="flex items-center gap-2 px-3 py-1.5 rounded-lg border bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300 text-xs font-bold uppercase tracking-wider hover:bg-green-100 transition-all"
+                               className="flex items-center gap-2 px-2 sm:px-3 py-1.5 rounded-lg border bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300 text-xs font-bold uppercase tracking-wider hover:bg-green-100 transition-all"
                                title="Download what has been generated so far"
                              >
                                <Save className="w-3.5 h-3.5" />
-                               <span>Save So Far</span>
+                               <span className="hidden sm:inline">Save So Far</span>
                              </button>
                            )}
                          </div>
                          
                          <button 
                             onClick={handleStop}
-                            className="flex items-center gap-2 text-xs font-bold text-red-500 hover:text-red-700 px-3 py-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors shrink-0"
+                            className="flex items-center gap-2 text-xs font-bold text-red-500 hover:text-red-700 px-2 sm:px-3 py-1.5 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors shrink-0"
+                            title="Cancel"
                          >
                            <StopCircle className="w-4 h-4" />
-                           <span>Cancel</span>
+                           <span className="hidden sm:inline">Cancel</span>
                          </button>
                       </div>
                     ) : (
@@ -980,6 +1024,13 @@ export default function App() {
             onClose={() => setIsSettingsOpen(false)}
             currentRpm={rpmLimit}
             onSave={setRpmLimit}
+          />
+          
+          <DocumentScannerModal
+            isOpen={isDocumentScannerOpen}
+            onClose={() => setIsDocumentScannerOpen(false)}
+            onExtract={handleDocumentExtract}
+            apiKey={apiKeys.length > 0 ? apiKeys[0] : null}
           />
         </div>
       </div>

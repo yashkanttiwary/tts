@@ -50,6 +50,46 @@ Return ONLY valid JSON. Do not include markdown formatting like \`\`\`json.`,
   }
 };
 
+export const extractTextFromImage = async (
+  file: File,
+  apiKey: string
+): Promise<string> => {
+  const ai = new GoogleGenAI({ apiKey });
+  
+  // Convert File to base64
+  const arrayBuffer = await file.arrayBuffer();
+  const base64String = btoa(
+    new Uint8Array(arrayBuffer).reduce((data, byte) => data + String.fromCharCode(byte), '')
+  );
+
+  const response = await ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { text: "Extract all the text from this image perfectly. Preserve the structure and paragraphs. Return ONLY the text, with no markdown formatting or extra commentary." },
+          { 
+            inlineData: {
+              data: base64String,
+              mimeType: file.type
+            }
+          }
+        ]
+      }
+    ],
+    config: {
+      temperature: 0.1,
+    }
+  });
+
+  if (!response.text) {
+    throw new Error("No text extracted from image");
+  }
+  
+  return response.text.trim();
+};
+
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 // The default style if none is provided
