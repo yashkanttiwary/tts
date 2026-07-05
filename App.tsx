@@ -101,6 +101,7 @@ export default function App() {
   
   // Refs
   const audioRef = useRef<HTMLAudioElement>(null);
+  const silentAudioRef = useRef<HTMLAudioElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextAudioStartTimeRef = useRef<number>(0);
@@ -490,6 +491,40 @@ export default function App() {
     const controller = new AbortController();
     setAbortController(controller);
 
+    if (silentAudioRef.current) {
+      silentAudioRef.current.play().catch(e => console.warn('Silent audio play failed', e));
+    }
+
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: 'Voice Studio Generation',
+        artist: 'Gemini Voice Studio',
+      });
+      navigator.mediaSession.setActionHandler('play', () => {
+        if (silentAudioRef.current) silentAudioRef.current.play().catch(() => {});
+        if (audioContextRef.current?.state === 'suspended') {
+          audioContextRef.current.resume();
+          setIsPreviewPaused(false);
+        }
+      });
+      navigator.mediaSession.setActionHandler('pause', () => {
+        if (silentAudioRef.current) silentAudioRef.current.pause();
+        if (audioContextRef.current?.state === 'running') {
+          audioContextRef.current.suspend();
+          setIsPreviewPaused(true);
+        }
+      });
+      navigator.mediaSession.setActionHandler('stop', () => {
+        controller.abort();
+        if (silentAudioRef.current) silentAudioRef.current.pause();
+        if (audioContextRef.current) {
+          audioContextRef.current.close();
+          audioContextRef.current = null;
+        }
+        setStatus(TTSStatus.IDLE);
+      });
+    }
+
     try {
       setProgressMessage('Analyzing text structure...');
       let generationChunks: {text: string, voice: string}[] = [];
@@ -607,6 +642,9 @@ export default function App() {
       audioContextRef.current.close();
       audioContextRef.current = null;
     }
+    if (silentAudioRef.current) {
+      silentAudioRef.current.pause();
+    }
     setStatus(TTSStatus.IDLE);
     setProgressMessage('Stopped.');
     setActiveKeyIndex(null);
@@ -618,6 +656,13 @@ export default function App() {
 
   return (
     <div className={isDarkMode ? 'dark' : ''}>
+      <audio 
+        ref={silentAudioRef} 
+        id="background-audio" 
+        loop 
+        playsInline 
+        src="data:audio/mpeg;base64,//OExAAAAANIAAAAAExBTUUzLjEwMKqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq" 
+      />
       <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 font-sans selection:bg-indigo-500/30 selection:text-indigo-800 dark:selection:text-indigo-200 transition-colors duration-300">
         
         {/* Background Gradients */}
